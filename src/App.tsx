@@ -54,16 +54,14 @@ import {
   Gamepad2,
   Users,
   Shield,
-  ScrollText,
   Crown,
   HelpCircle,
   LogOut,
   AlertCircle,
   MessageCircle,
-  Zap,
 } from 'lucide-react';
 
-type TabType = 'game' | 'chat' | 'ability' | 'players' | 'role' | 'logs' | 'host';
+type TabType = 'game' | 'chat' | 'players' | 'role' | 'logs' | 'host';
 
 export default function App() {
   // App Session State
@@ -119,20 +117,17 @@ export default function App() {
     if (gameState?.status === 'GAME_OVER') setActiveTab('game');
   }, [gameState?.status]);
 
-  // Phase changes must move every player to the screen they need right now.
-  // 대화 -> 방 선택 -> 능력 -> 낮 결과 -> 다음 라운드 대화
+  // 같은 방에서 새 게임을 시작할 때 역할 카드를 다시 한 번 보여줄 수 있게 초기화합니다.
   useEffect(() => {
-    if (gameState?.status !== 'PLAYING') return;
-
-    if (gameState.phase === 'PRE_SELECTION_DISCUSSION') {
-      setActiveTab('chat');
-    } else if (gameState.phase === 'ROOM_SELECTION' || gameState.phase === 'ROOM_DRAW') {
-      setActiveTab('game');
-    } else if (gameState.phase === 'ABILITY_ACTION') {
-      setActiveTab('ability');
-    } else if (gameState.phase === 'DAY') {
-      setActiveTab('game');
+    if (gameState?.status === 'LOBBY' && gameState?.gameId) {
+      delete acknowledgedRolesRef.current[gameState.gameId + '_role'];
     }
+  }, [gameState?.status, gameState?.gameId]);
+
+  // 단계가 바뀌면 무조건 '진행' 화면으로 복귀합니다.
+  // 사용자는 탭을 찾아다닐 필요 없이 현재 해야 할 행동만 따라가면 됩니다.
+  useEffect(() => {
+    if (gameState?.status === 'PLAYING') setActiveTab('game');
   }, [gameState?.phase, gameState?.status]);
 
   // Polling for real-time multiplayer synchronization
@@ -147,12 +142,12 @@ export default function App() {
         // Check if role should be shown initially when status changes to PLAYING
         if (
           updated.status === 'PLAYING' &&
-          !acknowledgedRolesRef.current[updated.gameId + '_' + updated.round]
+          !acknowledgedRolesRef.current[updated.gameId + '_role']
         ) {
           const self = updated.players.find((p) => p.id === currentUserId);
           if (self && self.role) {
             setShowInitialRoleModal(true);
-            acknowledgedRolesRef.current[updated.gameId + '_' + updated.round] = true;
+            acknowledgedRolesRef.current[updated.gameId + '_role'] = true;
           }
         }
       } catch (err) {
@@ -643,6 +638,7 @@ export default function App() {
             isHost={isHost}
             onUpdateMode={handleUpdateMode}
             onFillBots={handleFillBots}
+            onUpdateSettings={handleUpdateSettings}
             onStartGame={handleStartGame}
             isSubmitting={isSubmitting}
           />
@@ -689,25 +685,30 @@ export default function App() {
               />
             )}
 
-            {/* TAB: GAME (Main Play Screen) */}
-            {activeTab === 'game' && (
+            {/* TAB: GAME — 현재 단계만 보여주는 자동 진행 화면 */}
+            {activeTab === 'game' && currentPlayer && (
               <div className="space-y-5">
                 {gameState.phase === 'PRE_SELECTION_DISCUSSION' && (
-                  <div className="p-5 rounded-3xl bg-zinc-900/80 border border-zinc-800 space-y-3">
-                    <div className="flex items-center gap-2">
-                      <MessageCircle className="w-5 h-5 text-blue-400" />
-                      <h3 className="font-black text-white">자유 대화 단계</h3>
+                  <>
+                    <div className="p-4 rounded-2xl bg-blue-950/30 border border-blue-800/50">
+                      <div className="text-sm font-black text-white">1. 지금은 대화만 하세요</div>
+                      <p className="mt-1 text-xs text-zinc-300">시간이 끝나면 앱이 자동으로 방 선택 화면으로 바뀝니다. 따로 누를 버튼은 없습니다.</p>
                     </div>
-                    <p className="text-xs text-zinc-400 leading-relaxed">
-                      지금은 대화만 진행합니다. 시간이 끝나면 모든 플레이어 화면이 자동으로 <strong className="text-red-400">방 선택</strong>으로 이동합니다.
-                    </p>
-                    <button type="button" onClick={() => setActiveTab('chat')} className="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-sm font-bold text-white">채팅으로 이동</button>
-                  </div>
+                    <ChatPanel
+                      game={gameState}
+                      currentPlayer={currentPlayer}
+                      onSendMessage={handleSendChatMessage}
+                      isSubmitting={isSubmitting}
+                    />
+                  </>
                 )}
 
-                {/* 1. Room Selection Phase (2-Candidate Picker) */}
-                {currentPlayer &&
-                  (gameState.phase === 'ROOM_SELECTION' || gameState.phase === 'ROOM_DRAW') && (
+                {(gameState.phase === 'ROOM_SELECTION' || gameState.phase === 'ROOM_DRAW') && (
+                  <>
+                    <div className="p-4 rounded-2xl bg-red-950/30 border border-red-800/50">
+                      <div className="text-sm font-black text-white">2. 방 2개 중 하나를 고르세요</div>
+                      <p className="mt-1 text-xs text-zinc-300">후보 2개 중 하나를 누르고 선택 확정만 하면 됩니다. 안 고르면 제한시간 종료 시 자동 선택됩니다.</p>
+                    </div>
                     <RoomSelector
                       game={gameState}
                       currentPlayer={currentPlayer}
@@ -716,55 +717,58 @@ export default function App() {
                       onUsePrisonPass={handleUsePrisonPass}
                       isSubmitting={isSubmitting}
                     />
-                  )}
-
-                {/* 2. DAY Phase Display */}
-                {currentPlayer && gameState.phase === 'DAY' && (
-                  <DayPhase
-                    game={gameState}
-                    currentPlayer={currentPlayer}
-                    onSelectTab={(tab) => {
-                      if (tab === 'hub') setActiveTab('role');
-                      else if (tab === 'players') setActiveTab('players');
-                      else if (tab === 'logs') setActiveTab('logs');
-                    }}
-                    isHost={isHost}
-                    isSubmitting={isSubmitting}
-                  />
+                  </>
                 )}
 
-                {/* 4. In-Game Hold-to-Reveal Role Card */}
-                {currentPlayer?.role && (
-                  <div className="pt-2">
-                    <HoldToRevealRole role={currentPlayer.role} />
-                  </div>
+                {gameState.phase === 'ABILITY_ACTION' && (
+                  <>
+                    <div className="p-4 rounded-2xl bg-yellow-950/30 border border-yellow-800/50">
+                      <div className="text-sm font-black text-white">3. 특수능력이 있으면 지금 사용하세요</div>
+                      <p className="mt-1 text-xs text-zinc-300">버튼이 있는 직업만 선택하면 됩니다. 사용할 능력이 없으면 그대로 기다리면 자동으로 낮 결과로 넘어갑니다.</p>
+                    </div>
+                    <RoleAbilityHub
+                      game={gameState}
+                      currentPlayer={currentPlayer}
+                      onPoliceArrest={handlePoliceArrest}
+                      onCorruptPoliceArrest={handleCorruptPoliceArrest}
+                      onWardenJail={handleWardenJail}
+                      onGamblerBet={handleGamblerBet}
+                      onUsePrisonPass={handleUsePrisonPass}
+                      isSubmitting={isSubmitting}
+                    />
+                  </>
+                )}
+
+                {gameState.phase === 'DAY' && (
+                  <>
+                    <div className="p-4 rounded-2xl bg-amber-950/30 border border-amber-800/50">
+                      <div className="text-sm font-black text-white">4. 낮이 되었습니다 — 결과를 확인하세요</div>
+                      <p className="mt-1 text-xs text-zinc-300">잠시 후 다음 라운드 대화 화면으로 자동 이동합니다.</p>
+                    </div>
+                    <DayPhase
+                      game={gameState}
+                      currentPlayer={currentPlayer}
+                      onSelectTab={(tab) => {
+                        if (tab === 'hub') setActiveTab('role');
+                        else if (tab === 'players') setActiveTab('players');
+                        else if (tab === 'logs') setActiveTab('logs');
+                      }}
+                      isHost={isHost}
+                      isSubmitting={isSubmitting}
+                    />
+                  </>
                 )}
               </div>
             )}
 
-            {/* TAB: ABILITY - dedicated role ability controls */}
-            {activeTab === 'ability' && currentPlayer && (
-              <div className="space-y-4">
-                <div className="p-4 rounded-2xl bg-yellow-950/20 border border-yellow-800/40">
-                  <div className="flex items-center gap-2">
-                    <Zap className="w-5 h-5 text-yellow-400" />
-                    <div>
-                      <h3 className="text-sm font-black text-white">내 특수능력</h3>
-                      <p className="text-[11px] text-zinc-400">방 선택 직후 자동으로 열리는 단계입니다. 사용형 능력은 제한 시간 안에 여기서 실행합니다.</p>
-                    </div>
-                  </div>
-                </div>
-                <RoleAbilityHub
-                  game={gameState}
-                  currentPlayer={currentPlayer}
-                  onPoliceArrest={handlePoliceArrest}
-                  onCorruptPoliceArrest={handleCorruptPoliceArrest}
-                  onWardenJail={handleWardenJail}
-                  onGamblerBet={handleGamblerBet}
-                  onUsePrisonPass={handleUsePrisonPass}
-                  isSubmitting={isSubmitting}
-                />
-              </div>
+            {/* 채팅 탭은 참고용. 실제 대화 단계에서는 진행 화면에도 채팅이 자동 표시됩니다. */}
+            {activeTab === 'chat' && currentPlayer && (
+              <ChatPanel
+                game={gameState}
+                currentPlayer={currentPlayer}
+                onSendMessage={handleSendChatMessage}
+                isSubmitting={isSubmitting}
+              />
             )}
 
             {/* TAB: PLAYERS (List of 12) */}
@@ -823,16 +827,10 @@ export default function App() {
                     )}
                   </div>
                 </div>
-
                 {(gameState.status === 'PLAYING' || gameState.status === 'PAUSED') && (
-                  <button
-                    type="button"
-                    onClick={() => setActiveTab('ability')}
-                    className="w-full py-3.5 rounded-2xl bg-yellow-500 text-zinc-950 font-black text-sm flex items-center justify-center gap-2 active:scale-[0.98] transition-transform"
-                  >
-                    <Zap className="w-4 h-4" />
-                    특수능력 화면 열기
-                  </button>
+                  <div className="p-3 rounded-2xl bg-yellow-950/20 border border-yellow-800/40 text-xs text-yellow-200">
+                    특수능력 단계가 되면 필요한 조작 화면이 자동으로 표시됩니다. 따로 메뉴를 찾을 필요가 없습니다.
+                  </div>
                 )}
               </div>
             )}
@@ -873,7 +871,7 @@ export default function App() {
               }`}
             >
               <Gamepad2 className="w-5 h-5" />
-              <span className="text-[11px]">게임</span>
+              <span className="text-[11px]">진행</span>
             </button>
 
             <button
@@ -888,21 +886,6 @@ export default function App() {
               <MessageCircle className="w-5 h-5" />
               <span className="text-[11px]">채팅</span>
             </button>
-
-            {(gameState.status === 'PLAYING' || gameState.status === 'PAUSED') && (
-              <button
-                type="button"
-                onClick={() => setActiveTab('ability')}
-                className={`min-w-[64px] flex-1 py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
-                  activeTab === 'ability'
-                    ? 'text-yellow-400 bg-yellow-950/30 font-bold'
-                    : 'text-zinc-400 hover:text-zinc-200 font-medium'
-                }`}
-              >
-                <Zap className="w-5 h-5" />
-                <span className="text-[11px]">능력</span>
-              </button>
-            )}
 
             <button
               type="button"
@@ -928,19 +911,6 @@ export default function App() {
             >
               <Shield className="w-5 h-5" />
               <span className="text-[11px]">내 역할</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setActiveTab('logs')}
-              className={`min-w-[64px] flex-1 py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
-                activeTab === 'logs'
-                  ? 'text-red-500 bg-red-950/30 font-bold'
-                  : 'text-zinc-400 hover:text-zinc-200 font-medium'
-              }`}
-            >
-              <ScrollText className="w-5 h-5" />
-              <span className="text-[11px]">기록</span>
             </button>
 
             {isHost && (

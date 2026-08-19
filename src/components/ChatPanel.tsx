@@ -13,6 +13,7 @@ const PHASE_LABEL: Record<string, string> = {
   PRE_SELECTION_DISCUSSION: '사전 대화',
   ROOM_DRAW: '방 뽑기',
   ROOM_SELECTION: '방 선택',
+  ABILITY_ACTION: '특수능력',
   DAY: '낮',
   DISCUSSION: '토론',
   WARDEN_ACTION: '교도관 행동',
@@ -31,8 +32,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
 
   const messages = useMemo(() => game.chatMessages || [], [game.chatMessages]);
   const canSend =
-    game.status !== 'GAME_OVER' &&
-    (game.status === 'LOBBY' || currentPlayer.status === 'ALIVE');
+    game.status === 'LOBBY' ||
+    (game.status === 'PLAYING' && game.phase === 'PRE_SELECTION_DISCUSSION' && currentPlayer.status === 'ALIVE');
 
   useEffect(() => {
     const el = listRef.current;
@@ -58,7 +59,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
           <div className="min-w-0">
             <h3 className="text-sm font-black text-white">실시간 전체 채팅</h3>
             <p className="text-[11px] text-zinc-400 truncate">
-              같은 게임방 참가자 전원에게 공개됩니다.
+              같은 게임방 참가자 전원에게 공개됩니다. 규칙 기반 BOT도 대화에 참여합니다.
             </p>
           </div>
         </div>
@@ -96,6 +97,9 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
                   <div className={`max-w-[82%] ${isMine ? 'items-end' : 'items-start'} flex flex-col`}>
                     <div className="flex items-center gap-2 px-1 mb-1">
                       {!isMine && <span className="text-[11px] font-bold text-zinc-300">{item.nickname}</span>}
+                      {item.isBot && (
+                        <span className="text-[9px] font-black text-amber-300 bg-amber-950/70 border border-amber-800/60 px-1.5 py-0.5 rounded">BOT</span>
+                      )}
                       <span className="text-[9px] text-zinc-600">
                         {PHASE_LABEL[item.phase] || item.phase}
                       </span>
@@ -154,6 +158,8 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({
             <Lock className="w-3.5 h-3.5" />
             {game.status === 'GAME_OVER'
               ? '게임이 종료되어 채팅 입력이 잠겼습니다.'
+              : game.status === 'PLAYING' && game.phase !== 'PRE_SELECTION_DISCUSSION'
+              ? '채팅은 대화 시간에만 입력할 수 있습니다.'
               : '사망/제외된 플레이어는 채팅을 읽을 수만 있습니다.'}
           </div>
         )}

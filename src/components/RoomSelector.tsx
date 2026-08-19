@@ -116,7 +116,7 @@ export const RoomSelector: React.FC<RoomSelectorProps> = ({
   };
 
   const handleConfirmSelection = () => {
-    if (!chosenRoom || isConfirmed || isSubmitting) return;
+    if (!chosenRoom || chosenRoom === 'PRISON' || isConfirmed || isSubmitting) return;
     onSelectRoom(chosenRoom, true);
   };
 

@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { GameState, GameMode, Player } from '../types';
+import React, { useEffect, useState } from 'react';
+import { GameState, GameMode, Player, GameSettings, BotDifficulty } from '../types';
 import { FIXED_ROLES_PRESET, ROLES_DATA, getTeamColor } from '../rolesData';
 import {
   Users,
@@ -20,6 +20,7 @@ interface GameLobbyProps {
   isHost: boolean;
   onUpdateMode: (mode: GameMode, roleMapping?: Record<string, string>) => Promise<void>;
   onFillBots: () => Promise<void>;
+  onUpdateSettings: (settings: Partial<GameSettings>) => Promise<void>;
   onStartGame: () => Promise<void>;
   isSubmitting: boolean;
 }
@@ -30,14 +31,29 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
   isHost,
   onUpdateMode,
   onFillBots,
+  onUpdateSettings,
   onStartGame,
   isSubmitting,
 }) => {
   const [copied, setCopied] = useState(false);
   const [roleMapping, setRoleMapping] = useState<Record<string, string>>(game.roleMapping || {});
+  const [autoStartSeconds, setAutoStartSeconds] = useState<number | null>(null);
 
   const playerCount = game.players.length;
+  const botCount = game.players.filter((p) => p.isBot).length;
+  const humanCount = playerCount - botCount;
   const isFull = playerCount >= 12;
+
+  useEffect(() => {
+    if (!game.lobbyAutoStartAt || !isFull) {
+      setAutoStartSeconds(null);
+      return;
+    }
+    const update = () => setAutoStartSeconds(Math.max(0, Math.ceil((game.lobbyAutoStartAt! - Date.now()) / 1000)));
+    update();
+    const timer = setInterval(update, 200);
+    return () => clearInterval(timer);
+  }, [game.lobbyAutoStartAt, isFull]);
 
   const handleCopyCode = async () => {
     try {
@@ -84,6 +100,13 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
       await onUpdateMode(game.mode, updated);
     }
   };
+
+  const handleBotDifficulty = async (difficulty: BotDifficulty) => {
+    if (!isHost || isSubmitting) return;
+    await onUpdateSettings({ botDifficulty: difficulty });
+  };
+
+  const difficulty = game.settings.botDifficulty || 'NORMAL';
 
   return (
     <div className="w-full max-w-2xl mx-auto space-y-6">
@@ -177,6 +200,64 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
         </div>
       </div>
 
+      {/* Rule-based BOT intelligence */}
+      <div className="p-5 rounded-2xl bg-zinc-900/80 border border-zinc-800 space-y-4">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-black text-white flex items-center gap-2">
+              <Bot className="w-4 h-4 text-amber-400" />
+              BOT 추리 난이도
+            </h3>
+            <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
+              AI 연결 없이 규칙 기반으로 대화·의심·거짓말·특수능력을 수행합니다. 다른 플레이어의 비밀 역할은 읽지 않습니다.
+            </p>
+          </div>
+          <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-zinc-950 border border-zinc-700 text-zinc-300 whitespace-nowrap">
+            사람 {humanCount} · BOT {botCount}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-3 gap-2">
+          {([
+            ['EASY', '쉬움', '말수 적음 · 추리 실수 많음'],
+            ['NORMAL', '보통', '모순 추적 · 자연스러운 의심'],
+            ['HARD', '어려움', '기억·역질문·블러핑 강화'],
+          ] as Array<[BotDifficulty, string, string]>).map(([value, label, desc]) => (
+            <button
+              key={value}
+              type="button"
+              disabled={!isHost || isSubmitting}
+              onClick={() => handleBotDifficulty(value)}
+              className={`p-3 rounded-xl border text-left transition-all ${
+                difficulty === value
+                  ? 'bg-amber-950/50 border-amber-500 ring-1 ring-amber-500/40'
+                  : 'bg-zinc-950 border-zinc-800 hover:border-zinc-700'
+              } ${!isHost ? 'cursor-default' : 'cursor-pointer'}`}
+            >
+              <div className={`text-xs font-black ${difficulty === value ? 'text-amber-300' : 'text-zinc-200'}`}>
+                {label}
+              </div>
+              <div className="text-[10px] text-zinc-500 mt-1 leading-snug">{desc}</div>
+            </button>
+          ))}
+        </div>
+
+        {isHost && !isFull && (
+          <button
+            type="button"
+            onClick={onFillBots}
+            disabled={isSubmitting}
+            className="w-full py-3 rounded-xl bg-amber-600 hover:bg-amber-700 active:scale-[0.99] text-white text-sm font-black transition-all flex items-center justify-center gap-2"
+          >
+            <Bot className="w-4 h-4" />
+            빈자리 BOT으로 채우기 ({12 - playerCount}자리)
+          </button>
+        )}
+        {!isHost && (
+          <div className="text-center text-[11px] text-zinc-500">BOT 난이도는 방장이 설정합니다.</div>
+        )}
+      </div>
+
       {/* 12 Players Slots Grid */}
       <div className="space-y-3">
         <div className="flex items-center justify-between px-1">
@@ -185,18 +266,7 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
             참가자 슬롯 ({playerCount} / 12)
           </h3>
 
-          {/* Host Quick Fill Bots Button for Testing */}
-          {isHost && !isFull && (
-            <button
-              type="button"
-              onClick={onFillBots}
-              disabled={isSubmitting}
-              className="px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-xs font-bold text-zinc-200 transition-colors inline-flex items-center gap-1.5 cursor-pointer"
-            >
-              <Bot className="w-3.5 h-3.5 text-yellow-400" />
-              12인 봇으로 채우기 (테스트)
-            </button>
-          )}
+
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
@@ -296,34 +366,31 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
         </div>
       </div>
 
-      {/* Start Game Action */}
+      {/* Start Game Action — 12명 모이면 자동 시작 */}
       <div className="pt-2">
-        {isHost ? (
-          <div className="space-y-2">
-            <button
-              type="button"
-              disabled={!isFull || isSubmitting}
-              onClick={onStartGame}
-              className={`w-full py-4 rounded-2xl font-bold text-base transition-all flex items-center justify-center gap-2 shadow-2xl ${
-                isFull
-                  ? 'bg-red-600 hover:bg-red-700 active:scale-[0.98] text-white shadow-red-950/80 cursor-pointer'
-                  : 'bg-zinc-900 border border-zinc-800 text-zinc-500 cursor-not-allowed'
-              }`}
-            >
-              <Play className="w-5 h-5 fill-current" />
-              {isFull ? '게임 시작 (12인 준비 완료)' : `12명이 모두 참가해야 시작할 수 있습니다 (${playerCount}/12)`}
-            </button>
-
-            {!isFull && (
-              <p className="text-center text-xs text-zinc-400">
-                인원이 부족한 경우 상단의 <strong>[12인 봇으로 채우기]</strong> 버튼을 눌러 바로 테스트할 수 있습니다.
-              </p>
+        {isFull ? (
+          <div className="p-5 rounded-2xl bg-red-950/30 border border-red-800/60 text-center space-y-3">
+            <div className="text-xs font-bold text-red-300 tracking-widest">12 / 12 READY</div>
+            <div className="text-4xl font-black font-mono text-white">
+              {autoStartSeconds ?? 10}
+            </div>
+            <div className="text-sm font-black text-white">초 후 게임이 자동으로 시작됩니다</div>
+            <p className="text-xs text-zinc-400">방장이 아무것도 누르지 않아도 시작됩니다. 시작되면 각자 자기 역할 카드가 자동으로 뜹니다.</p>
+            {isHost && (
+              <button
+                type="button"
+                disabled={isSubmitting}
+                onClick={onStartGame}
+                className="w-full py-3 rounded-xl bg-red-600 hover:bg-red-700 text-white font-black text-sm active:scale-[0.98] transition-all"
+              >
+                지금 바로 시작
+              </button>
             )}
           </div>
         ) : (
           <div className="p-4 rounded-2xl bg-zinc-900 border border-zinc-800 text-center space-y-1">
-            <div className="text-sm font-bold text-zinc-200">방장이 게임을 시작하기를 기다리는 중입니다...</div>
-            <div className="text-xs text-zinc-400">12명이 모두 모이면 방장이 게임을 시작합니다.</div>
+            <div className="text-sm font-bold text-zinc-200">친구들을 기다리는 중입니다 ({playerCount}/12)</div>
+            <div className="text-xs text-zinc-400">12명이 모두 들어오면 10초 카운트다운 후 자동 시작됩니다.</div>
           </div>
         )}
       </div>

@@ -15,6 +15,8 @@ export type GamePhase =
 
 export type GameMode = 'FIXED' | 'RANDOM';
 
+export type BotDifficulty = 'EASY' | 'NORMAL' | 'HARD';
+
 export type RoomId = 'A' | 'B' | 'C' | 'D' | 'E' | 'F';
 
 export type RoomLocation = RoomId | 'PRISON';
@@ -81,6 +83,7 @@ export interface ChatMessage {
   timestamp: number;
   round: number;
   phase: GamePhase;
+  isBot?: boolean;
 }
 
 export interface GameLogEntry {
@@ -102,6 +105,7 @@ export interface GameSettings {
   citizenWinConditionText: string;
   neutralWinConditionText: string;
   autoAdvanceRound: boolean;
+  botDifficulty: BotDifficulty; // 규칙 기반 봇 추리/대화 난이도
 }
 
 export interface RolePreset {
@@ -119,6 +123,7 @@ export interface GameState {
   maxRound: number;
   phase: GamePhase;
   phaseExpiresAt?: number | null; // Milliseconds timestamp for synchronized countdown
+  lobbyAutoStartAt?: number | null; // 12명 입장 후 자동 시작 시각
   winner: TeamType | 'DRAW' | null;
   winnerReason: string | null;
   rooms: RoomId[];
