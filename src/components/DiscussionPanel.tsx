@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, Crown, Ghost, MessageCircle, Send, Sparkles } from 'lucide-react';
+import { Bot, Crown, Ghost, Heart, MessageCircle, Send, Skull, Sparkles, Users } from 'lucide-react';
 import { ChatMessage, GameState, Player } from '../types';
 
 interface Props {
@@ -39,6 +39,11 @@ export const DiscussionPanel: React.FC<Props> = ({ game, me, onSend, onGhostWhis
   };
 
   const isGhostPlayer = me.roleId === 'ghost' && me.status === 'DEAD';
+  const aliveCount = game.players.filter((p) => p.status === 'ALIVE').length;
+  const discussionPlayers = [...game.players].sort((a, b) => {
+    if (a.status !== b.status) return a.status === 'ALIVE' ? -1 : 1;
+    return a.joinedAt - b.joinedAt;
+  });
 
   return (
     <div className="space-y-3">
@@ -69,9 +74,60 @@ export const DiscussionPanel: React.FC<Props> = ({ game, me, onSend, onGhostWhis
       <div className="rounded-3xl bg-zinc-900 border border-zinc-800 overflow-hidden">
         <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between gap-2">
           <div className="font-black text-sm text-white flex items-center gap-2"><MessageCircle className="w-4 h-4 text-blue-400"/> 실시간 토론</div>
-          <div className="text-[10px] text-zinc-500 text-right"><Bot className="w-3.5 h-3.5 inline mr-1"/>BOT은 먼저 말하지 않고 질문받을 때만 답변</div>
+          <div className="text-[10px] text-zinc-500 text-right"><Bot className="w-3.5 h-3.5 inline mr-1"/>BOT은 질문받을 때만 답변</div>
         </div>
-        <div className="h-[390px] overflow-y-auto p-4 space-y-3 no-scrollbar">
+
+        {/* Discussion participant status board: public information only */}
+        <div className="px-3 py-3 border-b border-zinc-800 bg-zinc-950/55">
+          <div className="mb-2.5 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-1.5 text-xs font-black text-zinc-200">
+              <Users className="w-4 h-4 text-emerald-400"/> 참가자 현황
+            </div>
+            <div className="text-[11px] font-bold text-zinc-500">
+              생존 <span className="text-emerald-400">{aliveCount}</span> / {game.players.length}명
+            </div>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+            {discussionPlayers.map((p) => {
+              const alive = p.status === 'ALIVE';
+              const publicRole = p.mayorRevealed
+                ? '👑 시장'
+                : p.revealedRole && p.role
+                ? `${p.role.emoji} ${p.role.name}`
+                : null;
+              return (
+                <div
+                  key={p.id}
+                  className={`min-w-0 px-2.5 py-2 rounded-xl border ${
+                    alive
+                      ? 'bg-zinc-900 border-zinc-800'
+                      : 'bg-red-950/15 border-red-950/70 opacity-70'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <span className={`flex-shrink-0 ${alive ? 'text-emerald-400' : 'text-red-400'}`}>
+                      {alive ? <Heart className="w-3.5 h-3.5"/> : <Skull className="w-3.5 h-3.5"/>}
+                    </span>
+                    <span className={`truncate text-[11px] font-black ${alive ? 'text-zinc-100' : 'text-zinc-500 line-through'}`}>
+                      {p.nickname}
+                    </span>
+                    {p.id === me.id && <span className="flex-shrink-0 px-1 py-0.5 rounded bg-blue-600 text-[8px] font-black text-white">나</span>}
+                    {p.isBot && <span className="flex-shrink-0 px-1 py-0.5 rounded bg-amber-950 text-[8px] font-black text-amber-400">BOT</span>}
+                  </div>
+                  <div className="mt-1 flex items-center justify-between gap-1 text-[9px]">
+                    <span className={alive ? 'font-bold text-emerald-500' : 'font-bold text-red-500'}>
+                      {alive ? '생존' : '탈락'}
+                    </span>
+                    {publicRole && <span className="truncate text-zinc-500">{publicRole}</span>}
+                    {!publicRole && p.isHost && <span className="text-amber-500">방장</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="h-[360px] overflow-y-auto p-4 space-y-3 no-scrollbar">
           {messages.length === 0 && <div className="h-full flex items-center justify-center text-xs text-zinc-600">첫 의견을 남겨보세요.</div>}
           {messages.map((m) => {
             const replied = m.replyToMessageId ? messageMap.get(m.replyToMessageId) : undefined;
