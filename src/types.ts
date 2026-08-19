@@ -72,6 +72,16 @@ export interface Player {
   personalWinReason?: string;
 }
 
+export interface ChatMessage {
+  id: string;
+  playerId: string;
+  nickname: string;
+  message: string;
+  timestamp: number;
+  round: number;
+  phase: GamePhase;
+}
+
 export interface GameLogEntry {
   id: string;
   round: number;
@@ -111,6 +121,7 @@ export interface GameState {
   rooms: RoomId[];
   players: Player[];
   logs: GameLogEntry[];
+  chatMessages: ChatMessage[];
   settings: GameSettings;
   createdAt: number;
   updatedAt: number;

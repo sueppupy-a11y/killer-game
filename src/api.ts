@@ -49,6 +49,22 @@ export async function fetchGameState(gameId: string, playerId?: string): Promise
   return data.game;
 }
 
+
+export async function sendChatMessage(
+  gameId: string,
+  playerId: string,
+  message: string
+): Promise<GameState> {
+  const res = await fetch(`${API_BASE}/${gameId}/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ playerId, message }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || '채팅 전송에 실패했습니다.');
+  return data.game;
+}
+
 export async function updateGameMode(
   gameId: string,
   playerId: string,

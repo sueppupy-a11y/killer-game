@@ -42,7 +42,6 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
 }) => {
   const roleId = currentPlayer.roleId;
   const isAlive = currentPlayer.status === 'ALIVE';
-  const isHost = currentPlayer.isHost;
 
   const [selectedTargetId, setSelectedTargetId] = useState<string>('');
   const [confirmModalType, setConfirmModalType] = useState<
@@ -61,6 +60,30 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
 
   return (
     <div className="w-full space-y-4" id="role-ability-hub">
+      {/* Shared inventory / emergency actions */}
+      <div className="p-4 rounded-2xl bg-zinc-900/80 border border-zinc-800 space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h4 className="font-bold text-sm text-white">보유 아이템</h4>
+            <p className="text-[11px] text-zinc-400">방 지정권은 방 선택 화면에서, 탈옥권은 감옥에 갇혔을 때 사용합니다.</p>
+          </div>
+          <div className="flex gap-2 text-[11px] font-bold">
+            <span className="px-2.5 py-1 rounded-full bg-zinc-950 border border-zinc-700 text-zinc-300">방 지정권 {currentPlayer.inventory?.roomPassCount || 0}</span>
+            <span className="px-2.5 py-1 rounded-full bg-zinc-950 border border-zinc-700 text-zinc-300">탈옥권 {currentPlayer.inventory?.prisonPassCount || 0}</span>
+          </div>
+        </div>
+
+        {currentPlayer.currentRoom === 'PRISON' && isAlive && (currentPlayer.inventory?.prisonPassCount || 0) > 0 && (
+          <button
+            type="button"
+            disabled={isSubmitting}
+            onClick={onUsePrisonPass}
+            className="w-full py-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 font-black text-sm active:scale-[0.98] transition-all disabled:opacity-50"
+          >
+            탈옥권 사용하기
+          </button>
+        )}
+      </div>
       {/* 1. 경찰 (Police) View */}
       {roleId === 'police' && (
         <div className="p-4 rounded-2xl bg-blue-950/40 border border-blue-800/60 space-y-3">
@@ -340,7 +363,7 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
             </div>
           </div>
 
-          {game.phase === 'RESULT_DISCUSSION' && currentPlayer.currentRoom ? (
+          {currentPlayer.currentRoom && currentPlayer.extrasensoryRoomCount !== null && currentPlayer.extrasensoryRoomCount !== undefined ? (
             <div className="p-3.5 rounded-xl bg-indigo-900/50 border border-indigo-600 text-center space-y-1">
               <div className="text-xs text-indigo-300 font-semibold">
                 {currentPlayer.currentRoom} ROOM 실제 서버 배정 인원
@@ -380,7 +403,18 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
             수감됩니다.
           </p>
 
-          {isAlive && game.phase === 'PRE_SELECTION_DISCUSSION' && (
+          <div className="flex items-center justify-between text-[11px] text-zinc-400">
+            <span>남은 수감 지정 횟수</span>
+            <span className="font-mono font-bold text-blue-300">{currentPlayer.abilityUsesRemaining}회</span>
+          </div>
+
+          {game.wardenTargetPlayerId && (
+            <div className="p-3 rounded-xl bg-emerald-950/40 border border-emerald-800/50 text-xs text-emerald-300 font-bold text-center">
+              이번 라운드 감옥 대상 지정 완료
+            </div>
+          )}
+
+          {isAlive && game.phase === 'PRE_SELECTION_DISCUSSION' && !game.wardenTargetPlayerId && currentPlayer.abilityUsesRemaining > 0 && (
             <div className="flex gap-2 pt-1">
               <select
                 value={selectedTargetId}
@@ -525,6 +559,22 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
               승리하고 본인이 끝까지 생존하면 개인 승리합니다.
             </div>
           )}
+        </div>
+      )}
+
+      {/* 12. 일반시민 (Citizen) View */}
+      {roleId === 'citizen' && (
+        <div className="p-4 rounded-2xl bg-blue-950/30 border border-blue-800/40 space-y-2">
+          <div className="flex items-center gap-2">
+            <div className="p-2 rounded-xl bg-blue-900/40 text-blue-300">
+              <UserCheck className="w-5 h-5" />
+            </div>
+            <div>
+              <h4 className="font-bold text-sm text-white">일반시민 — 직접 사용 능력 없음</h4>
+              <p className="text-xs text-blue-300">채팅과 추리, 방 선택으로 살인마를 찾아내십시오.</p>
+            </div>
+          </div>
+          <p className="text-xs text-zinc-400">이 역할은 버튼형 특수능력이 없는 대신 자유롭게 정보를 모으고 토론에 참여합니다.</p>
         </div>
       )}
 

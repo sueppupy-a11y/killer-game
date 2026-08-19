@@ -11,6 +11,7 @@ import {
   joinGame,
   leaveGame,
   fetchGameState,
+  sendChatMessage,
   updateGameMode,
   fillBots,
   startGame,
@@ -35,6 +36,7 @@ import {
 // Subcomponents
 import { HomeStart } from './components/HomeStart';
 import { GameLobby } from './components/GameLobby';
+import { ChatPanel } from './components/ChatPanel';
 import { InitialRoleModal, HoldToRevealRole } from './components/RoleRevealCard';
 import { PhaseTimerBar } from './components/PhaseTimerBar';
 import { RoomSelector } from './components/RoomSelector';
@@ -57,9 +59,11 @@ import {
   HelpCircle,
   LogOut,
   AlertCircle,
+  MessageCircle,
+  Zap,
 } from 'lucide-react';
 
-type TabType = 'game' | 'players' | 'role' | 'logs' | 'host';
+type TabType = 'game' | 'chat' | 'ability' | 'players' | 'role' | 'logs' | 'host';
 
 export default function App() {
   // App Session State
@@ -109,6 +113,11 @@ export default function App() {
         });
     }
   }, []);
+
+  // Always surface the result screen immediately when a game ends.
+  useEffect(() => {
+    if (gameState?.status === 'GAME_OVER') setActiveTab('game');
+  }, [gameState?.status]);
 
   // Polling for real-time multiplayer synchronization
   useEffect(() => {
@@ -495,6 +504,20 @@ export default function App() {
     }
   };
 
+  // 21. Public Room Chat
+  const handleSendChatMessage = async (message: string) => {
+    if (!gameState) return;
+    setIsSubmitting(true);
+    try {
+      const updated = await sendChatMessage(gameState.gameId, currentUserId, message);
+      setGameState(updated);
+    } catch (err: any) {
+      triggerToast(err.message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   const handleOpenRules = (tab: 'rules' | 'roles' | 'rooms' = 'rules') => {
     setRulesModalTab(tab);
     setRulesModalOpen(true);
@@ -597,7 +620,7 @@ export default function App() {
       {/* Main Content Area */}
       <main className="flex-1 max-w-3xl w-full mx-auto p-4 space-y-5 animate-fadeIn">
         {/* LOBBY STATE */}
-        {gameState.status === 'LOBBY' && (
+        {gameState.status === 'LOBBY' && activeTab === 'game' && (
           <GameLobby
             game={gameState}
             currentUserId={currentUserId}
@@ -610,11 +633,21 @@ export default function App() {
         )}
 
         {/* GAME OVER STATE */}
-        {gameState.status === 'GAME_OVER' && (
+        {gameState.status === 'GAME_OVER' && activeTab === 'game' && (
           <ResultScreen
             game={gameState}
             isHost={isHost}
             onRestart={handleRestartGame}
+            isSubmitting={isSubmitting}
+          />
+        )}
+
+        {/* REAL-TIME CHAT TAB - available from lobby through active game */}
+        {activeTab === 'chat' && currentPlayer && (
+          <ChatPanel
+            game={gameState}
+            currentPlayer={currentPlayer}
+            onSendMessage={handleSendChatMessage}
             isSubmitting={isSubmitting}
           />
         )}
@@ -633,11 +666,25 @@ export default function App() {
             {/* TAB: GAME (Main Play Screen) */}
             {activeTab === 'game' && (
               <div className="space-y-5">
+                {gameState.phase === 'PRE_SELECTION_DISCUSSION' && (
+                  <div className="p-5 rounded-3xl bg-zinc-900/80 border border-zinc-800 space-y-3">
+                    <div className="flex items-center gap-2">
+                      <MessageCircle className="w-5 h-5 text-blue-400" />
+                      <h3 className="font-black text-white">사전 대화 · 특수능력 단계</h3>
+                    </div>
+                    <p className="text-xs text-zinc-400 leading-relaxed">
+                      채팅에서 전략을 논의하고, 사용형 직업은 아래의 <strong className="text-yellow-400">능력</strong> 탭에서 행동을 먼저 처리하세요. 시간이 끝나면 방 선택으로 자동 이동합니다.
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button type="button" onClick={() => setActiveTab('chat')} className="py-3 rounded-xl bg-zinc-800 border border-zinc-700 text-sm font-bold text-white">채팅 열기</button>
+                      <button type="button" onClick={() => setActiveTab('ability')} className="py-3 rounded-xl bg-yellow-500 text-zinc-950 text-sm font-black">능력 사용</button>
+                    </div>
+                  </div>
+                )}
+
                 {/* 1. Room Selection Phase (2-Candidate Picker) */}
                 {currentPlayer &&
-                  (gameState.phase === 'ROOM_SELECTION' ||
-                    gameState.phase === 'ROOM_DRAW' ||
-                    gameState.phase === 'PRE_SELECTION_DISCUSSION') && (
+                  (gameState.phase === 'ROOM_SELECTION' || gameState.phase === 'ROOM_DRAW') && (
                     <RoomSelector
                       game={gameState}
                       currentPlayer={currentPlayer}
@@ -664,26 +711,37 @@ export default function App() {
                   />
                 )}
 
-                {/* 3. Role Specific Abilities, Trackers, Clues & Special Actions */}
-                {currentPlayer && (
-                  <RoleAbilityHub
-                    game={gameState}
-                    currentPlayer={currentPlayer}
-                    onPoliceArrest={handlePoliceArrest}
-                    onCorruptPoliceArrest={handleCorruptPoliceArrest}
-                    onWardenJail={handleWardenJail}
-                    onGamblerBet={handleGamblerBet}
-                    onUsePrisonPass={handleUsePrisonPass}
-                    isSubmitting={isSubmitting}
-                  />
-                )}
-
                 {/* 4. In-Game Hold-to-Reveal Role Card */}
                 {currentPlayer?.role && (
                   <div className="pt-2">
                     <HoldToRevealRole role={currentPlayer.role} />
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* TAB: ABILITY - dedicated role ability controls */}
+            {activeTab === 'ability' && currentPlayer && (
+              <div className="space-y-4">
+                <div className="p-4 rounded-2xl bg-yellow-950/20 border border-yellow-800/40">
+                  <div className="flex items-center gap-2">
+                    <Zap className="w-5 h-5 text-yellow-400" />
+                    <div>
+                      <h3 className="text-sm font-black text-white">내 특수능력</h3>
+                      <p className="text-[11px] text-zinc-400">사용형 능력은 여기서 직접 실행합니다. 자동/패시브 능력은 발동 조건과 결과가 표시됩니다.</p>
+                    </div>
+                  </div>
+                </div>
+                <RoleAbilityHub
+                  game={gameState}
+                  currentPlayer={currentPlayer}
+                  onPoliceArrest={handlePoliceArrest}
+                  onCorruptPoliceArrest={handleCorruptPoliceArrest}
+                  onWardenJail={handleWardenJail}
+                  onGamblerBet={handleGamblerBet}
+                  onUsePrisonPass={handleUsePrisonPass}
+                  isSubmitting={isSubmitting}
+                />
               </div>
             )}
 
@@ -743,6 +801,17 @@ export default function App() {
                     )}
                   </div>
                 </div>
+
+                {(gameState.status === 'PLAYING' || gameState.status === 'PAUSED') && (
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('ability')}
+                    className="w-full py-3.5 rounded-2xl bg-yellow-500 text-zinc-950 font-black text-sm flex items-center justify-center gap-2 active:scale-[0.98] transition-transform"
+                  >
+                    <Zap className="w-4 h-4" />
+                    특수능력 화면 열기
+                  </button>
+                )}
               </div>
             )}
 
@@ -771,11 +840,11 @@ export default function App() {
       {/* Bottom Sticky Tab Navigation */}
       {gameState && (
         <nav className="fixed bottom-0 left-0 right-0 z-40 bg-zinc-950/95 backdrop-blur-md border-t border-zinc-800 px-2 py-1.5">
-          <div className="max-w-lg mx-auto grid grid-cols-4 sm:grid-cols-5 gap-1">
+          <div className="max-w-2xl mx-auto flex gap-1 overflow-x-auto no-scrollbar">
             <button
               type="button"
               onClick={() => setActiveTab('game')}
-              className={`py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
+              className={`min-w-[64px] flex-1 py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
                 activeTab === 'game'
                   ? 'text-red-500 bg-red-950/30 font-bold'
                   : 'text-zinc-400 hover:text-zinc-200 font-medium'
@@ -787,8 +856,36 @@ export default function App() {
 
             <button
               type="button"
+              onClick={() => setActiveTab('chat')}
+              className={`min-w-[64px] flex-1 py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
+                activeTab === 'chat'
+                  ? 'text-red-500 bg-red-950/30 font-bold'
+                  : 'text-zinc-400 hover:text-zinc-200 font-medium'
+              }`}
+            >
+              <MessageCircle className="w-5 h-5" />
+              <span className="text-[11px]">채팅</span>
+            </button>
+
+            {(gameState.status === 'PLAYING' || gameState.status === 'PAUSED') && (
+              <button
+                type="button"
+                onClick={() => setActiveTab('ability')}
+                className={`min-w-[64px] flex-1 py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
+                  activeTab === 'ability'
+                    ? 'text-yellow-400 bg-yellow-950/30 font-bold'
+                    : 'text-zinc-400 hover:text-zinc-200 font-medium'
+                }`}
+              >
+                <Zap className="w-5 h-5" />
+                <span className="text-[11px]">능력</span>
+              </button>
+            )}
+
+            <button
+              type="button"
               onClick={() => setActiveTab('players')}
-              className={`py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
+              className={`min-w-[64px] flex-1 py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
                 activeTab === 'players'
                   ? 'text-red-500 bg-red-950/30 font-bold'
                   : 'text-zinc-400 hover:text-zinc-200 font-medium'
@@ -801,7 +898,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => setActiveTab('role')}
-              className={`py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
+              className={`min-w-[64px] flex-1 py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
                 activeTab === 'role'
                   ? 'text-red-500 bg-red-950/30 font-bold'
                   : 'text-zinc-400 hover:text-zinc-200 font-medium'
@@ -814,7 +911,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => setActiveTab('logs')}
-              className={`py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
+              className={`min-w-[64px] flex-1 py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
                 activeTab === 'logs'
                   ? 'text-red-500 bg-red-950/30 font-bold'
                   : 'text-zinc-400 hover:text-zinc-200 font-medium'
@@ -828,7 +925,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setActiveTab('host')}
-                className={`py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
+                className={`min-w-[64px] flex-1 py-2 px-1 rounded-xl flex flex-col items-center justify-center gap-1 transition-all cursor-pointer ${
                   activeTab === 'host'
                     ? 'text-amber-400 bg-amber-950/30 font-bold'
                     : 'text-amber-500/70 hover:text-amber-300 font-medium'

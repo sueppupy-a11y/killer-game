@@ -43,6 +43,9 @@ function loadGamesFromDisk() {
     const raw = fs.readFileSync(DATA_FILE, 'utf8');
     if (!raw.trim()) return;
     const parsed = JSON.parse(raw) as Record<string, StoredGame>;
+    Object.values(parsed).forEach((game) => {
+      if (!game.chatMessages) game.chatMessages = [];
+    });
     Object.assign(games, parsed);
     console.log(`[store] restored ${Object.keys(parsed).length} game(s) from ${DATA_FILE}`);
   } catch (error) {
@@ -163,6 +166,8 @@ function initializeRoundRoomOptions(game: GameState) {
  */
 function sanitizeGameState(game: GameState, requesterId?: string): GameState {
   const isGameOver = game.status === 'GAME_OVER';
+  const requester = game.players.find((p) => p.id === requesterId);
+  const requesterIsWarden = requester?.roleId === 'warden';
 
   const sanitizedPlayers: Player[] = game.players.map((p) => {
     const isSelf = p.id === requesterId;
@@ -212,6 +217,12 @@ function sanitizeGameState(game: GameState, requesterId?: string): GameState {
   return {
     ...game,
     players: sanitizedPlayers,
+    // Never leak secret role mapping or pending private clues before game over.
+    roleMapping: isGameOver ? game.roleMapping : undefined,
+    pendingForensicEvents: undefined,
+    wardenTargetPlayerId: isGameOver || requesterIsWarden ? game.wardenTargetPlayerId : null,
+    finalVotingVotes: isGameOver ? game.finalVotingVotes : undefined,
+    chatMessages: game.chatMessages || [],
   };
 }
 
@@ -317,6 +328,25 @@ function evaluateWinCondition(game: GameState) {
   }
 }
 
+function deliverForensicCluesForNewRound(game: GameState) {
+  const forensicPlayer = game.players.find((p) => p.roleId === 'forensic' && p.status === 'ALIVE');
+  if (!forensicPlayer || !game.pendingForensicEvents?.length) return;
+
+  const ready = game.pendingForensicEvents.filter((ev) => ev.round < game.round);
+  const waiting = game.pendingForensicEvents.filter((ev) => ev.round >= game.round);
+  if (!ready.length) return;
+
+  if (!forensicPlayer.forensicClues) forensicPlayer.forensicClues = [];
+  ready.forEach((ev) => {
+    forensicPlayer.forensicClues?.unshift({
+      round: ev.round,
+      victimNickname: ev.victimNickname,
+      clue: `[ROUND ${ev.round} 감식 결과] ${ev.victimNickname} 님의 사망 현장은 ${ev.room} 구역이며, 단둘이 고립된 상태에서 공격이 발생한 것으로 확인되었습니다.`,
+    });
+  });
+  game.pendingForensicEvents = waiting;
+}
+
 /**
  * Execute Movement Resolution & Job Actions:
  * 1. Process Prison (Warden)
@@ -399,11 +429,6 @@ function executeResolveMovement(game: GameState) {
           } else if (victimRole === 'police') {
             // Police protected in normal room & receives secret alert!
             victim.policeAttackedAlert = true;
-            addGameLog(
-              game,
-              `[비밀 경보] 이번 라운드에 살인마의 습격 시도가 발생했습니다. (경찰 방어 발동)`,
-              'police'
-            );
           } else {
             // Murder succeeds!
             victim.status = 'DEAD';
@@ -474,20 +499,6 @@ function executeResolveMovement(game: GameState) {
       victimNickname: murderedVictim.nickname,
       room: murderRoom,
     });
-  }
-
-  // If previous pending forensic events exist, dispatch to Forensic Scientist
-  const forensicPlayer = game.players.find((p) => p.roleId === 'forensic' && p.status === 'ALIVE');
-  if (forensicPlayer && game.pendingForensicEvents && game.pendingForensicEvents.length > 0) {
-    if (!forensicPlayer.forensicClues) forensicPlayer.forensicClues = [];
-    game.pendingForensicEvents.forEach((ev) => {
-      forensicPlayer.forensicClues?.unshift({
-        round: ev.round,
-        victimNickname: ev.victimNickname,
-        clue: `[ROUND ${ev.round} 감식 결과] ${ev.victimNickname} 님의 사망 현장은 ${ev.room} 구역이며, 단둘이 고립된 상태에서 흉기에 의한 일격으로 확인되었습니다.`,
-      });
-    });
-    game.pendingForensicEvents = [];
   }
 
   game.phase = 'DAY';
@@ -598,6 +609,7 @@ app.post('/api/games/create', (req: Request, res: Response) => {
     rooms: ALL_ROOMS,
     players: [hostPlayer],
     logs: [],
+    chatMessages: [],
     settings: { ...DEFAULT_SETTINGS },
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -884,8 +896,8 @@ app.post('/api/games/:gameId/start', (req: Request, res: Response) => {
 
   game.status = 'PLAYING';
   game.round = 1;
-  game.phase = 'ROOM_SELECTION';
-  game.phaseExpiresAt = null;
+  game.phase = 'PRE_SELECTION_DISCUSSION';
+  game.phaseExpiresAt = Date.now() + game.settings.preDiscussionTimeSeconds * 1000;
   game.winner = null;
   game.winnerReason = null;
   game.killerKillCount = 0;
@@ -898,7 +910,7 @@ app.post('/api/games/:gameId/start', (req: Request, res: Response) => {
 
   addGameLog(
     game,
-    `[게임 시작] 12인의 비밀 역할이 배정되었습니다. ROUND 01 방 뽑기/선택 단계가 시작되었습니다!`,
+    `[게임 시작] 12인의 비밀 역할이 배정되었습니다. ROUND 01 사전 대화/특수능력 단계가 시작되었습니다!`,
     'phase'
   );
 
@@ -1068,15 +1080,31 @@ app.post('/api/games/:gameId/warden-jail', (req: Request, res: Response) => {
   }
 
   const requester = game.players.find((p) => p.id === playerId);
-  if (!requester || (requester.roleId !== 'warden' && !requester.isHost)) {
+  if (!requester || requester.roleId !== 'warden') {
     res.status(403).json({ error: '교도관만 감옥 수감 능력을 사용할 수 있습니다.' });
+    return;
+  }
+  if (requester.status !== 'ALIVE') {
+    res.status(400).json({ error: '생존한 교도관만 능력을 사용할 수 있습니다.' });
+    return;
+  }
+  if (game.phase !== 'PRE_SELECTION_DISCUSSION') {
+    res.status(400).json({ error: '교도관 능력은 방 선택 전 사전 대화 단계에서만 사용할 수 있습니다.' });
+    return;
+  }
+  if (game.wardenTargetPlayerId) {
+    res.status(400).json({ error: '이번 라운드의 감옥 대상을 이미 지정했습니다.' });
+    return;
+  }
+  if (targetPlayerId && requester.abilityUsesRemaining <= 0) {
+    res.status(400).json({ error: '교도관 능력 사용 횟수를 모두 소진했습니다.' });
     return;
   }
 
   if (targetPlayerId) {
     const target = game.players.find((p) => p.id === targetPlayerId);
-    if (!target || target.status !== 'ALIVE') {
-      res.status(400).json({ error: '유효한 생존 플레이어를 선택해주세요.' });
+    if (!target || target.status !== 'ALIVE' || target.id === requester.id) {
+      res.status(400).json({ error: '본인을 제외한 유효한 생존 플레이어를 선택해주세요.' });
       return;
     }
 
@@ -1084,6 +1112,7 @@ app.post('/api/games/:gameId/warden-jail', (req: Request, res: Response) => {
     target.selectedRoom = null;
     target.drawnRoom = null;
     game.wardenTargetPlayerId = target.id;
+    requester.abilityUsesRemaining = Math.max(0, requester.abilityUsesRemaining - 1);
 
     addGameLog(
       game,
@@ -1176,23 +1205,25 @@ app.post('/api/games/:gameId/police-arrest', (req: Request, res: Response) => {
   }
 
   const requester = game.players.find((p) => p.id === playerId);
-  const isHost = requester?.isHost;
-  const isPolice = requester?.roleId === 'police';
-
-  if (!isHost && !isPolice) {
+  if (!requester || requester.roleId !== 'police') {
     res.status(403).json({ error: '경찰만 체포 기능을 실행할 수 있습니다.' });
     return;
   }
-  if (!isHost && requester?.status !== 'ALIVE') {
+  if (requester.status !== 'ALIVE') {
     res.status(400).json({ error: '사망하거나 제외된 경찰은 행동할 수 없습니다.' });
+    return;
+  }
+  if (requester.abilityUsesRemaining <= 0) {
+    res.status(400).json({ error: '경찰 체포권을 이미 사용했습니다.' });
     return;
   }
 
   const target = game.players.find((p) => p.id === targetPlayerId);
-  if (!target || target.status !== 'ALIVE') {
-    res.status(400).json({ error: '생존한 플레이어만 체포할 수 있습니다.' });
+  if (!target || target.status !== 'ALIVE' || target.id === requester.id) {
+    res.status(400).json({ error: '본인을 제외한 생존 플레이어만 체포할 수 있습니다.' });
     return;
   }
+  requester.abilityUsesRemaining = 0;
 
   const isRealKiller = target.roleId === 'killer';
 
@@ -1211,9 +1242,7 @@ app.post('/api/games/:gameId/police-arrest', (req: Request, res: Response) => {
   } else {
     // Wrong arrest: Target and Police both REMOVED!
     target.status = 'REMOVED';
-    if (requester && !isHost) {
-      requester.status = 'REMOVED';
-    }
+    requester.status = 'REMOVED';
 
     addGameLog(
       game,
@@ -1245,18 +1274,22 @@ app.post('/api/games/:gameId/corrupt-police-arrest', (req: Request, res: Respons
   }
 
   const requester = game.players.find((p) => p.id === playerId);
-  if (!requester || (requester.roleId !== 'corrupt_police' && !requester.isHost)) {
+  if (!requester || requester.roleId !== 'corrupt_police') {
     res.status(403).json({ error: '부패경찰만 사용할 수 있습니다.' });
     return;
   }
-  if (requester.status !== 'ALIVE' && !requester.isHost) {
+  if (requester.status !== 'ALIVE') {
     res.status(400).json({ error: '생존 상태에서만 사용 가능합니다.' });
+    return;
+  }
+  if (requester.abilityUsesRemaining <= 0) {
+    res.status(400).json({ error: '동귀어진 체포권을 이미 사용했습니다.' });
     return;
   }
 
   const target = game.players.find((p) => p.id === targetPlayerId);
-  if (!target || target.status !== 'ALIVE') {
-    res.status(400).json({ error: '생존한 대상만 체포할 수 있습니다.' });
+  if (!target || target.status !== 'ALIVE' || target.id === requester.id) {
+    res.status(400).json({ error: '본인을 제외한 생존한 대상만 체포할 수 있습니다.' });
     return;
   }
 
@@ -1330,8 +1363,9 @@ app.post('/api/games/:gameId/next-round', (req: Request, res: Response) => {
   }
 
   game.round += 1;
-  game.phase = 'ROOM_SELECTION';
-  game.phaseExpiresAt = null;
+  deliverForensicCluesForNewRound(game);
+  game.phase = 'PRE_SELECTION_DISCUSSION';
+  game.phaseExpiresAt = Date.now() + game.settings.preDiscussionTimeSeconds * 1000;
   game.wardenTargetPlayerId = null;
 
   // Reset and initialize 2 distinct room options for each alive player
@@ -1341,7 +1375,7 @@ app.post('/api/games/:gameId/next-round', (req: Request, res: Response) => {
   const aliveCount = game.players.filter((p) => p.status === 'ALIVE').length;
   addGameLog(
     game,
-    `ROUND ${String(game.round).padStart(2, '0')} 시작! 새로운 방 후보 2개가 지급되었습니다. (${aliveCount}명 생존)`,
+    `ROUND ${String(game.round).padStart(2, '0')} 시작! 사전 대화 및 특수능력 사용 단계입니다. (${aliveCount}명 생존)`,
     'phase'
   );
 
@@ -1515,6 +1549,7 @@ app.post('/api/games/:gameId/restart', (req: Request, res: Response) => {
   });
 
   game.logs = [];
+  game.chatMessages = [];
   game.updatedAt = Date.now();
 
   res.json({ success: true, game: sanitizeGameState(game, playerId) });
@@ -1541,6 +1576,76 @@ app.post('/api/games/:gameId/host/update-settings', (req: Request, res: Response
   }
 
   game.updatedAt = Date.now();
+  res.json({ success: true, game: sanitizeGameState(game, playerId) });
+});
+
+// Public room chat (near-real-time through the existing 1s game-state sync)
+const lastChatAt: Record<string, number> = {};
+app.post('/api/games/:gameId/chat', (req: Request, res: Response) => {
+  const gameId = (req.params.gameId || '').toUpperCase();
+  const { playerId, message } = req.body;
+  const game = games[gameId];
+
+  if (!game) {
+    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
+    return;
+  }
+
+  const player = game.players.find((p) => p.id === playerId);
+  if (!player) {
+    res.status(404).json({ error: '플레이어를 찾을 수 없습니다.' });
+    return;
+  }
+
+  if (game.status === 'GAME_OVER') {
+    res.status(400).json({ error: '종료된 게임에서는 채팅을 보낼 수 없습니다.' });
+    return;
+  }
+
+  if (game.status !== 'LOBBY' && player.status !== 'ALIVE') {
+    res.status(403).json({ error: '사망하거나 제외된 플레이어는 채팅을 읽을 수만 있습니다.' });
+    return;
+  }
+
+  if (typeof message !== 'string') {
+    res.status(400).json({ error: '메시지를 입력해주세요.' });
+    return;
+  }
+
+  const cleanMessage = message.replace(/\s+/g, ' ').trim();
+  if (!cleanMessage) {
+    res.status(400).json({ error: '메시지를 입력해주세요.' });
+    return;
+  }
+  if (cleanMessage.length > 300) {
+    res.status(400).json({ error: '채팅은 최대 300자까지 입력할 수 있습니다.' });
+    return;
+  }
+
+  const throttleKey = `${gameId}:${playerId}`;
+  const now = Date.now();
+  if (lastChatAt[throttleKey] && now - lastChatAt[throttleKey] < 400) {
+    res.status(429).json({ error: '메시지를 너무 빠르게 보내고 있습니다.' });
+    return;
+  }
+  lastChatAt[throttleKey] = now;
+
+  if (!game.chatMessages) game.chatMessages = [];
+  game.chatMessages.push({
+    id: generateId(),
+    playerId: player.id,
+    nickname: player.nickname,
+    message: cleanMessage,
+    timestamp: now,
+    round: game.round,
+    phase: game.phase,
+  });
+
+  if (game.chatMessages.length > 200) {
+    game.chatMessages = game.chatMessages.slice(-200);
+  }
+
+  game.updatedAt = now;
   res.json({ success: true, game: sanitizeGameState(game, playerId) });
 });
 
