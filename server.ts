@@ -212,8 +212,8 @@ function resetBotPhaseState(game: GameState, phase: GamePhase) {
     bot.botBrain ||= initBrain();
     if (phase === 'DISCUSSION') {
       bot.botBrain.discussionChatCount = 0;
-      const ghostDelay = bot.status === 'DEAD' && bot.roleId === 'ghost' ? rand(10, 28) : rand(profile.chatMin, profile.chatMax);
-      bot.botBrain.nextChatAt = now() + ghostDelay * 1000;
+      // BOTs stay silent by default. They only receive nextChatAt when a human asks a question.
+      bot.botBrain.nextChatAt = undefined;
       bot.botBrain.pendingReplyMessageId = undefined;
     }
     if ((phase === 'NIGHT' || phase === 'VOTE') && bot.status === 'ALIVE') {
@@ -671,7 +671,13 @@ function reasonForSuspicion(game: StoredGame, bot: Player, target: Player): stri
 }
 
 function isQuestionLike(text: string): boolean {
-  return /[?？]|누구|누굴|누가|왜|이유|근거|뭐|무엇|어때|생각|의견|의심|수상|투표|찍|역할|직업|정체|어젯밤|밤에|조사|보호|추적|믿어|맞아|아니야/.test(text);
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  if (/[?？]/.test(t)) return true;
+  // Korean chat often omits '?'. Only explicit interrogative/request phrasing counts as a question.
+  if (/(누구|누굴|누가|왜|뭐|무엇|어때|어떻게|어디|언제|몇|이유|근거)/.test(t)) return true;
+  if (/(알려줘|말해줘|대답해줘|설명해줘|골라줘|확인해줘|말해봐|대답해봐)\s*[.!~]*$/.test(t)) return true;
+  return false;
 }
 
 function directBotAnswer(game: StoredGame, bot: Player, human: ChatMessage): string {
@@ -827,30 +833,30 @@ function botDiscussionMessage(game: StoredGame, bot: Player): string {
 
 function runBotDiscussion(game: StoredGame, bot: Player) {
   if (game.phase !== 'DISCUSSION' || bot.status !== 'ALIVE') return;
-  const profile = botProfile(game.settings.botDifficulty);
   bot.botBrain ||= initBrain();
 
   const pending = bot.botBrain.pendingReplyMessageId
     ? game.chatMessages.find((m) => m.id === bot.botBrain?.pendingReplyMessageId && !m.system && !m.isBot && m.round === game.round)
     : undefined;
 
-  if (!pending && bot.botBrain.discussionChatCount >= profile.maxChats) return;
-  maybeRevealBotMayor(game, bot);
+  // No unsolicited BOT monologues. A BOT speaks only when a human question is queued for it.
+  if (!pending) {
+    bot.botBrain.nextChatAt = undefined;
+    return;
+  }
 
-  const message = pending ? directBotAnswer(game, bot, pending) : botDiscussionMessage(game, bot);
+  maybeRevealBotMayor(game, bot);
+  const message = directBotAnswer(game, bot, pending);
   const chat: ChatMessage = {
     id: id(), playerId: bot.id, nickname: bot.nickname, message, timestamp: now(), round: game.round, isBot: true,
-    replyToMessageId: pending?.id,
+    replyToMessageId: pending.id,
   };
   game.chatMessages.push(chat);
   if (game.chatMessages.length > 240) game.chatMessages.splice(0, game.chatMessages.length - 240);
-  bot.botBrain.discussionChatCount += pending ? 0 : 1;
   bot.botBrain.lastChatAt = now();
-  bot.botBrain.nextChatAt = now() + rand(profile.chatMin, profile.chatMax) * 1000;
-  if (pending) {
-    bot.botBrain.lastReplyMessageId = pending.id;
-    bot.botBrain.pendingReplyMessageId = undefined;
-  }
+  bot.botBrain.lastReplyMessageId = pending.id;
+  bot.botBrain.pendingReplyMessageId = undefined;
+  bot.botBrain.nextChatAt = undefined;
   updateBrainsFromChat(game, chat);
 }
 
@@ -901,9 +907,7 @@ function tickGame(game: StoredGame) {
     for (const bot of game.players.filter((p) => p.isBot && p.status === 'ALIVE')) {
       if ((bot.botBrain?.nextChatAt || Infinity) <= t) runBotDiscussion(game, bot);
     }
-    for (const ghost of game.players.filter((p) => p.isBot && p.status === 'DEAD' && p.roleId === 'ghost' && (p.ghostWhispersRemaining || 0) > 0)) {
-      if ((ghost.botBrain?.nextChatAt || Infinity) <= t) runBotGhostWhisper(game, ghost);
-    }
+    // Dead ghost BOTs also stay silent automatically; human ghost players can still use the whisper ability.
   }
   if (game.phase === 'VOTE') {
     for (const bot of game.players.filter((p) => p.isBot && p.status === 'ALIVE')) {
@@ -1142,32 +1146,32 @@ app.post('/api/games/:gameId/chat', (req, res) => {
   if (game.chatMessages.length > 240) game.chatMessages.splice(0, game.chatMessages.length - 240);
   updateBrainsFromChat(game, chat);
 
-  // Human questions get priority over BOT monologues. If a BOT name is mentioned,
-  // that BOT is the primary responder. General questions get one or two responders.
+  // BOT chat is response-only. They never speak first.
+  // If a specific BOT is named, only that BOT answers. Otherwise, a question gets exactly one BOT answer.
   const livingBots = game.players.filter((x) => x.isBot && x.status === 'ALIVE');
   const trimmedMessage = message.trim();
   const addressedBot = livingBots.find((x) =>
     trimmedMessage.startsWith(x.nickname) ||
     trimmedMessage.includes(`@${x.nickname}`) ||
     trimmedMessage.includes(`${x.nickname}아`) ||
-    trimmedMessage.includes(`${x.nickname}야`)
+    trimmedMessage.includes(`${x.nickname}야`) ||
+    trimmedMessage.includes(`${x.nickname}님`)
   );
   const question = isQuestionLike(message);
-  let responsiveBots: Player[] = [];
-  if (addressedBot) responsiveBots = [addressedBot];
-  else if (question) responsiveBots = shuffle(livingBots).slice(0, game.settings.botDifficulty === 'HARD' ? 2 : 1);
-  else responsiveBots = shuffle(livingBots).slice(0, 1);
+  let responsiveBot: Player | undefined;
+  if (question && addressedBot) responsiveBot = addressedBot;
+  else if (question && livingBots.length) responsiveBot = pick(livingBots);
 
-  const responseDelay = game.settings.botDifficulty === 'HARD' ? [1, 2] : game.settings.botDifficulty === 'EASY' ? [2, 4] : [1, 3];
-  const responsiveIds = new Set(responsiveBots.map((x) => x.id));
-  for (const bot of livingBots) {
-    bot.botBrain ||= initBrain();
-    if (responsiveIds.has(bot.id)) {
-      bot.botBrain.pendingReplyMessageId = chat.id;
-      bot.botBrain.nextChatAt = Math.min(bot.botBrain.nextChatAt || Infinity, now() + rand(responseDelay[0], responseDelay[1]) * 1000);
-    } else if (question || addressedBot) {
-      // Other BOTs wait so the direct answer is not buried under unrelated chatter.
-      bot.botBrain.nextChatAt = Math.max(bot.botBrain.nextChatAt || 0, now() + rand(5, 8) * 1000);
+  if (responsiveBot) {
+    const responseDelay = game.settings.botDifficulty === 'HARD' ? [1, 2] : game.settings.botDifficulty === 'EASY' ? [2, 4] : [1, 3];
+    for (const bot of livingBots) {
+      bot.botBrain ||= initBrain();
+      if (bot.id === responsiveBot.id) {
+        bot.botBrain.pendingReplyMessageId = chat.id;
+        bot.botBrain.nextChatAt = now() + rand(responseDelay[0], responseDelay[1]) * 1000;
+      } else if (!bot.botBrain.pendingReplyMessageId) {
+        bot.botBrain.nextChatAt = undefined;
+      }
     }
   }
   persistSoon();
