@@ -1,6 +1,6 @@
 {
-  "name": "살인자 게임 v6 · 마피아 능력전",
+  "name": "살인자 게임 v8 · 마피아 능력전",
   "description": "12인 멀티플레이 마피아 게임. 능력 역할, 자동 단계 진행, 실시간 채팅, 규칙 기반 지능형 BOT 지원.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MULTIPLAYER_MAFIA", "RULE_BASED_BOTS", "AUTO_PHASE_FLOW"]
+  "majorCapabilities": ["MULTIPLAYER_MAFIA", "RULE_BASED_BOTS", "DIRECT_BOT_REPLIES", "GHOST_WHISPERS", "AUTO_PHASE_FLOW"]
 }

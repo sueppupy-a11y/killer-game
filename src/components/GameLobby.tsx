@@ -1,23 +1,24 @@
 import React, { useEffect, useState } from 'react';
-import { Bot, Check, Copy, Crown, Play, Share2, Sparkles, Users } from 'lucide-react';
+import { Bot, Check, Crown, Play, Share2, Sparkles, Trash2, Users } from 'lucide-react';
 import { BotDifficulty, GameState } from '../types';
 
 interface Props {
   game: GameState;
   currentUserId: string;
   onFillBots: () => Promise<void>;
+  onRemoveBots: () => Promise<void>;
   onStart: () => Promise<void>;
   onDifficulty: (value: BotDifficulty) => Promise<void>;
   busy: boolean;
 }
 
 const DIFF: Array<{ id: BotDifficulty; name: string; desc: string }> = [
-  { id: 'EASY', name: '쉬움', desc: '추리가 단순하고 실수도 많음' },
-  { id: 'NORMAL', name: '보통', desc: '발언·투표를 기억하며 자연스럽게 추리' },
-  { id: 'HARD', name: '어려움', desc: '모순·투표 패턴까지 적극적으로 추적' },
+  { id: 'EASY', name: '쉬움', desc: '질문에는 답하지만 추리가 단순하고 실수도 많음' },
+  { id: 'NORMAL', name: '보통', desc: '질문에 바로 반응하고 발언·투표를 기억하며 추리' },
+  { id: 'HARD', name: '어려움', desc: '후속 질문 맥락과 모순·투표 패턴까지 적극 추적' },
 ];
 
-export const GameLobby: React.FC<Props> = ({ game, currentUserId, onFillBots, onStart, onDifficulty, busy }) => {
+export const GameLobby: React.FC<Props> = ({ game, currentUserId, onFillBots, onRemoveBots, onStart, onDifficulty, busy }) => {
   const me = game.players.find((p) => p.id === currentUserId);
   const isHost = !!me?.isHost;
   const [copied, setCopied] = useState(false);
@@ -68,11 +69,19 @@ export const GameLobby: React.FC<Props> = ({ game, currentUserId, onFillBots, on
               </button>
             ))}
           </div>
-          {!full && (
-            <button onClick={onFillBots} disabled={busy} className="w-full py-3.5 rounded-2xl bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 font-bold text-sm flex items-center justify-center gap-2">
-              <Bot className="w-4 h-4 text-amber-400"/> 빈자리 BOT으로 채우기
-            </button>
-          )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {!full && (
+              <button onClick={onFillBots} disabled={busy} className="w-full py-3.5 rounded-2xl bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 font-bold text-sm flex items-center justify-center gap-2">
+                <Bot className="w-4 h-4 text-amber-400"/> 빈자리 BOT으로 채우기
+              </button>
+            )}
+            {botCount > 0 && (
+              <button onClick={onRemoveBots} disabled={busy} className="w-full py-3.5 rounded-2xl bg-zinc-950 hover:bg-zinc-900 border border-zinc-800 font-bold text-sm text-zinc-300 flex items-center justify-center gap-2">
+                <Trash2 className="w-4 h-4 text-zinc-500"/> BOT 모두 빼기
+              </button>
+            )}
+          </div>
+          {botCount > 0 && <p className="text-[11px] text-zinc-500 text-center">친구가 이 방에 들어오면 가득 찬 경우 BOT 한 명이 자동으로 빠지고 친구가 그 자리를 사용합니다.</p>}
         </div>
       )}
 
@@ -94,7 +103,13 @@ export const GameLobby: React.FC<Props> = ({ game, currentUserId, onFillBots, on
       {full ? (
         <div className="p-5 rounded-3xl bg-red-950/30 border border-red-800/60 text-center">
           <div className="text-sm font-black text-white">12명 준비 완료</div>
-          <div className="mt-1 text-xs text-red-300">{countdown !== null ? `${countdown}초 후 자동으로 게임이 시작됩니다.` : '곧 자동으로 시작됩니다.'}</div>
+          <div className="mt-1 text-xs text-red-300">
+            {countdown !== null
+              ? `${countdown}초 후 자동으로 게임이 시작됩니다.`
+              : botCount > 0
+              ? 'BOT 자리에 친구가 들어올 수 있습니다. 준비되면 방장이 시작하세요.'
+              : '모두 준비되었습니다. 방장이 시작하면 됩니다.'}
+          </div>
           {isHost && <button onClick={onStart} disabled={busy} className="mt-3 px-5 py-2.5 rounded-xl bg-red-600 font-bold text-sm inline-flex items-center gap-2"><Play className="w-4 h-4"/> 지금 시작</button>}
         </div>
       ) : (

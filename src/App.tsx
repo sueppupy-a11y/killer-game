@@ -2,8 +2,8 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { Crown, HelpCircle, LogOut, Pause, Play, Shield, Users, X } from 'lucide-react';
 import { BotDifficulty, GameState, NightActionType } from './types';
 import {
-  createGame, fetchGameState, fillBots, joinGame, leaveGame, revealMayor, returnToLobby,
-  sendChat, startGame, submitNightAction, submitVote, togglePause, updateSettings,
+  createGame, fetchGameState, fillBots, joinGame, leaveGame, removeBots, revealMayor, returnToLobby,
+  sendChat, sendGhostWhisper, startGame, submitNightAction, submitVote, togglePause, updateSettings,
 } from './api';
 import { HomeStart } from './components/HomeStart';
 import { GameLobby } from './components/GameLobby';
@@ -32,16 +32,16 @@ export default function App() {
     const params = new URLSearchParams(window.location.search);
     const invite = params.get('code')?.trim().toUpperCase() || '';
     setInitialCode(invite);
-    const savedCode = localStorage.getItem('killer_v6_game') || '';
-    const savedPlayer = localStorage.getItem('killer_v6_player') || '';
+    const savedCode = localStorage.getItem('killer_v8_game') || '';
+    const savedPlayer = localStorage.getItem('killer_v8_player') || '';
     if (invite && savedCode && invite !== savedCode) {
-      localStorage.removeItem('killer_v6_game'); localStorage.removeItem('killer_v6_player');
+      localStorage.removeItem('killer_v8_game'); localStorage.removeItem('killer_v8_player');
       return;
     }
     const code = invite || savedCode;
     if (code && savedPlayer && (!invite || invite === savedCode)) {
       fetchGameState(code, savedPlayer).then((g) => { setGame(g); setPlayerId(savedPlayer); }).catch(() => {
-        localStorage.removeItem('killer_v6_game'); localStorage.removeItem('killer_v6_player');
+        localStorage.removeItem('killer_v8_game'); localStorage.removeItem('killer_v8_player');
       });
     }
   }, []);
@@ -65,7 +65,7 @@ export default function App() {
   const notify = (message: string) => { setToast(message); setTimeout(() => setToast(null), 3200); };
   const run = async (fn: () => Promise<void>) => { setBusy(true); try { await fn(); } catch (e: any) { notify(e.message || '오류가 발생했습니다.'); } finally { setBusy(false); } };
   const saveSession = (code: string, pid: string) => {
-    localStorage.setItem('killer_v6_game', code); localStorage.setItem('killer_v6_player', pid);
+    localStorage.setItem('killer_v8_game', code); localStorage.setItem('killer_v8_player', pid);
     window.history.replaceState({}, '', `${window.location.pathname}?code=${code}`);
   };
 
@@ -80,7 +80,7 @@ export default function App() {
     if (game.status !== 'LOBBY') { notify('게임 중에는 나갈 필요가 없습니다. 창을 닫았다가 같은 링크로 돌아오면 복귀됩니다.'); return; }
     if (!confirm('게임방에서 나갈까요?')) return;
     await leaveGame(game.gameId, playerId);
-    localStorage.removeItem('killer_v6_game'); localStorage.removeItem('killer_v6_player');
+    localStorage.removeItem('killer_v8_game'); localStorage.removeItem('killer_v8_player');
     setGame(null); setPlayerId(''); window.history.replaceState({}, '', window.location.pathname);
   });
 
@@ -104,7 +104,7 @@ export default function App() {
       </header>
 
       <main className="max-w-2xl mx-auto px-4 py-5 space-y-4">
-        {game.status === 'LOBBY' && <GameLobby game={game} currentUserId={playerId} onFillBots={() => update(fillBots(game.gameId, playerId))} onStart={() => update(startGame(game.gameId, playerId))} onDifficulty={(d: BotDifficulty) => update(updateSettings(game.gameId, playerId, { botDifficulty: d }))} busy={busy}/>} 
+        {game.status === 'LOBBY' && <GameLobby game={game} currentUserId={playerId} onFillBots={() => update(fillBots(game.gameId, playerId))} onRemoveBots={() => update(removeBots(game.gameId, playerId))} onStart={() => update(startGame(game.gameId, playerId))} onDifficulty={(d: BotDifficulty) => update(updateSettings(game.gameId, playerId, { botDifficulty: d }))} busy={busy}/>} 
 
         {(game.status === 'PLAYING' || game.status === 'PAUSED') && <>
           <PhaseBanner game={game}/>
@@ -112,19 +112,19 @@ export default function App() {
             {game.phase === 'ROLE_REVEAL' && <div className="space-y-3"><RoleCard game={game} player={me}/><div className="text-center text-xs text-zinc-500">잠시 후 자동으로 밤이 시작됩니다.</div></div>}
             {game.phase === 'NIGHT' && <NightPanel game={game} me={me} onSubmit={(type: NightActionType, targetId: string) => update(submitNightAction(game.gameId, playerId, type, targetId))} busy={busy}/>} 
             {game.phase === 'MORNING' && <MorningPanel game={game} me={me}/>} 
-            {game.phase === 'DISCUSSION' && <DiscussionPanel game={game} me={me} onSend={(message) => update(sendChat(game.gameId, playerId, message))} onRevealMayor={() => update(revealMayor(game.gameId, playerId))} busy={busy}/>} 
+            {game.phase === 'DISCUSSION' && <DiscussionPanel game={game} me={me} onSend={(message) => update(sendChat(game.gameId, playerId, message))} onGhostWhisper={(message) => update(sendGhostWhisper(game.gameId, playerId, message))} onRevealMayor={() => update(revealMayor(game.gameId, playerId))} busy={busy}/>} 
             {game.phase === 'VOTE' && <VotePanel game={game} me={me} onVote={(targetId) => update(submitVote(game.gameId, playerId, targetId))} busy={busy}/>} 
             {game.phase === 'EXECUTION' && <ExecutionPanel game={game}/>} 
           </>}
         </>}
 
-        {game.status === 'GAME_OVER' && <GameOver game={game} isHost={isHost} onLobby={() => update(returnToLobby(game.gameId, playerId))} busy={busy}/>} 
+        {game.status === 'GAME_OVER' && <GameOver game={game} isHost={isHost} onLobby={(keepBots) => update(returnToLobby(game.gameId, playerId, keepBots))} busy={busy}/>} 
       </main>
 
       {showRole && me.role && <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm p-4 flex items-center justify-center"><div className="w-full max-w-md"><RoleCard game={game} player={me} onClose={() => setShowRole(false)}/></div></div>}
       {showPlayers && <PlayerList game={game} currentUserId={playerId} onClose={() => setShowPlayers(false)}/>} 
       {showRules && <RulesModal onClose={() => setShowRules(false)}/>} 
-      {showHost && <HostModal game={game} busy={busy} onClose={() => setShowHost(false)} onPause={() => update(togglePause(game.gameId, playerId))} onLobby={() => run(async () => { if (!confirm('현재 게임을 종료하고 로비로 돌아갈까요?')) return; setGame(await returnToLobby(game.gameId, playerId)); setShowHost(false); })}/>} 
+      {showHost && <HostModal game={game} busy={busy} onClose={() => setShowHost(false)} onPause={() => update(togglePause(game.gameId, playerId))} onLobby={() => run(async () => { if (!confirm('현재 게임을 종료하고 로비로 돌아갈까요?')) return; setGame(await returnToLobby(game.gameId, playerId, true)); setShowHost(false); })}/>} 
       {toast && <Toast text={toast}/>} 
     </div>
   );

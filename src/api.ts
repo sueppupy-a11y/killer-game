@@ -31,6 +31,11 @@ export async function fillBots(gameId: string, playerId: string): Promise<GameSt
   return data.game;
 }
 
+export async function removeBots(gameId: string, playerId: string): Promise<GameState> {
+  const data = await json<{ game: GameState }>(await fetch(`${API_BASE}/${gameId}/host/remove-bots`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ playerId }) }));
+  return data.game;
+}
+
 export async function updateSettings(gameId: string, playerId: string, settings: Partial<GameSettings> & { botDifficulty?: BotDifficulty }): Promise<GameState> {
   const data = await json<{ game: GameState }>(await fetch(`${API_BASE}/${gameId}/host/settings`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ playerId, settings }) }));
   return data.game;
@@ -43,6 +48,11 @@ export async function startGame(gameId: string, playerId: string): Promise<GameS
 
 export async function sendChat(gameId: string, playerId: string, message: string): Promise<GameState> {
   const data = await json<{ game: GameState }>(await fetch(`${API_BASE}/${gameId}/chat`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ playerId, message }) }));
+  return data.game;
+}
+
+export async function sendGhostWhisper(gameId: string, playerId: string, message: string): Promise<GameState> {
+  const data = await json<{ game: GameState }>(await fetch(`${API_BASE}/${gameId}/ghost-whisper`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ playerId, message }) }));
   return data.game;
 }
 
@@ -66,7 +76,7 @@ export async function togglePause(gameId: string, playerId: string): Promise<Gam
   return data.game;
 }
 
-export async function returnToLobby(gameId: string, playerId: string): Promise<GameState> {
-  const data = await json<{ game: GameState }>(await fetch(`${API_BASE}/${gameId}/host/return-lobby`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ playerId }) }));
+export async function returnToLobby(gameId: string, playerId: string, keepBots = true): Promise<GameState> {
+  const data = await json<{ game: GameState }>(await fetch(`${API_BASE}/${gameId}/host/return-lobby`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ playerId, keepBots }) }));
   return data.game;
 }

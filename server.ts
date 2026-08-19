@@ -25,9 +25,9 @@ import { ROLE_POOL, ROLES } from './src/rolesData';
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), '.data');
-const DATA_FILE = path.join(DATA_DIR, 'games-v6.json');
+const DATA_FILE = path.join(DATA_DIR, 'games-v8.json');
 const MAX_PLAYERS = 12;
-const GAME_VERSION = 6;
+const GAME_VERSION = 8;
 
 app.use(express.json());
 
@@ -83,7 +83,7 @@ function loadGames() {
       game.lastExecutionResult ||= null;
       games[code] = game;
     }
-    console.log(`[store] restored ${Object.keys(games).length} v6 game(s)`);
+    console.log(`[store] restored ${Object.keys(games).length} v8 game(s)`);
   } catch (e) {
     console.error('[store] restore failed', e);
   }
@@ -185,6 +185,7 @@ function initBrain(): BotBrain {
   return {
     suspicion: {}, lastChatAt: 0, nextChatAt: 0, nextActionAt: 0,
     discussionChatCount: 0, lastProcessedChatAt: 0, roleClaims: {}, sharedClueIds: [],
+    pendingReplyMessageId: undefined, lastReplyMessageId: undefined, focusTargetId: undefined,
   } as BotBrain;
 }
 
@@ -207,13 +208,15 @@ function botProfile(diff: BotDifficulty) {
 
 function resetBotPhaseState(game: GameState, phase: GamePhase) {
   const profile = botProfile(game.settings.botDifficulty);
-  for (const bot of game.players.filter((p) => p.isBot && p.status === 'ALIVE')) {
+  for (const bot of game.players.filter((p) => p.isBot && (p.status === 'ALIVE' || (p.roleId === 'ghost' && (p.ghostWhispersRemaining || 0) > 0)))) {
     bot.botBrain ||= initBrain();
     if (phase === 'DISCUSSION') {
       bot.botBrain.discussionChatCount = 0;
-      bot.botBrain.nextChatAt = now() + rand(profile.chatMin, profile.chatMax) * 1000;
+      const ghostDelay = bot.status === 'DEAD' && bot.roleId === 'ghost' ? rand(10, 28) : rand(profile.chatMin, profile.chatMax);
+      bot.botBrain.nextChatAt = now() + ghostDelay * 1000;
+      bot.botBrain.pendingReplyMessageId = undefined;
     }
-    if (phase === 'NIGHT' || phase === 'VOTE') {
+    if ((phase === 'NIGHT' || phase === 'VOTE') && bot.status === 'ALIVE') {
       bot.botBrain.nextActionAt = now() + rand(profile.actionMin, profile.actionMax) * 1000;
     }
   }
@@ -240,6 +243,7 @@ function assignRoles(game: StoredGame) {
     p.status = 'ALIVE';
     p.revealedRole = false;
     p.mayorRevealed = false;
+    p.ghostWhispersRemaining = p.roleId === 'ghost' ? 2 : 0;
     p.privateClues = [];
     if (p.isBot) p.botBrain = initBrain();
   });
@@ -458,10 +462,10 @@ function updateBrainsFromChat(game: GameState, msg: ChatMessage) {
   const accuse = /(수상|의심|살인마|거짓|이상해|이상하|찜찜|몰아)/.test(text);
   const trust = /(믿어|믿음|시민 같|시민같|괜찮아|확실히 시민)/.test(text);
   const roleWords: Array<[string, RoleId]> = [
-    ['경찰', 'police'], ['의사', 'doctor'], ['경호원', 'bodyguard'], ['탐정', 'detective'], ['초감각', 'psychic'], ['시장', 'mayor'],
+    ['경찰', 'police'], ['의사', 'doctor'], ['경호원', 'bodyguard'], ['탐정', 'detective'], ['초감각', 'psychic'], ['시장', 'mayor'], ['유령', 'ghost'],
   ];
 
-  for (const bot of game.players.filter((p) => p.isBot && p.status === 'ALIVE')) {
+  for (const bot of game.players.filter((p) => p.isBot && (p.status === 'ALIVE' || (p.roleId === 'ghost' && (p.ghostWhispersRemaining || 0) > 0)))) {
     bot.botBrain ||= initBrain();
     if (msg.timestamp <= bot.botBrain.lastProcessedChatAt) continue;
     const factor = game.settings.botDifficulty === 'HARD' ? 1.5 : game.settings.botDifficulty === 'EASY' ? 0.6 : 1;
@@ -631,13 +635,143 @@ function markClueShared(bot: Player, clue: PrivateClue) {
   brain.sharedClueIds.push(clue.id);
 }
 
+function findMentionedAlivePlayer(game: GameState, text: string, excludeId?: string): Player | null {
+  const normalized = text.replace(/\s+/g, ' ');
+  return alive(game).find((p) => p.id !== excludeId && normalized.includes(p.nickname)) || null;
+}
+
+function latestClueAbout(bot: Player, targetId: string): PrivateClue | null {
+  return [...bot.privateClues].reverse().find((c) => c.targetPlayerId === targetId) || null;
+}
+
+function hasDuplicateRoleClaim(bot: Player, targetId: string): boolean {
+  const claim = bot.botBrain?.roleClaims[targetId];
+  if (!claim) return false;
+  return Object.entries(bot.botBrain?.roleClaims || {}).some(([pid, rid]) => pid !== targetId && rid === claim);
+}
+
+function reasonForSuspicion(game: StoredGame, bot: Player, target: Player): string {
+  const clue = latestClueAbout(bot, target.id);
+  if (clue?.resultCode === 'KILLER') return '내가 가진 정보에서 살인마 쪽으로 잡혀서';
+  if (clue?.resultCode === 'CITIZEN') return '내 정보로는 시민 쪽에 가까워 보여서 오히려 다른 사람을 보고 있어';
+  if (clue?.resultCode === 'ACTED' || clue?.resultCode === 'VISITED') return '밤 행동 흔적이 확인돼서 설명을 더 듣고 싶어서';
+  if (hasDuplicateRoleClaim(bot, target.id)) return '같은 역할을 주장한 사람이 겹쳐서 둘 중 하나는 거짓말일 가능성이 있어서';
+
+  const recent = [...game.chatMessages].reverse().find((m) =>
+    !m.system && m.playerId === target.id && m.round === game.round && /(의심|살인마|확실|경찰|의사|탐정|시장|시민)/.test(m.message)
+  );
+  if (recent) return '방금 말한 내용이 아직 확인되지 않았고 다른 발언이랑 같이 봐야 해서';
+
+  if (game.lastExecutionResult?.breakdown?.some((v) => v.voterNickname === target.nickname)) {
+    return '지난 투표 방향까지 같이 보면 조금 더 확인할 필요가 있어 보여서';
+  }
+  const score = bot.botBrain?.suspicion[target.id] || 0;
+  if (score > 10) return '지금까지 나온 의심과 발언 흐름이 계속 그쪽으로 쌓여서';
+  return '아직 결정적인 근거는 없지만 지금까지의 말 흐름에서 가장 걸려서';
+}
+
+function isQuestionLike(text: string): boolean {
+  return /[?？]|누구|누굴|누가|왜|이유|근거|뭐|무엇|어때|생각|의견|의심|수상|투표|찍|역할|직업|정체|어젯밤|밤에|조사|보호|추적|믿어|맞아|아니야/.test(text);
+}
+
+function directBotAnswer(game: StoredGame, bot: Player, human: ChatMessage): string {
+  bot.botBrain ||= initBrain();
+  const text = human.message.replace(/\s+/g, ' ').trim();
+  const asker = game.players.find((p) => p.id === human.playerId);
+  const mentioned = findMentionedAlivePlayer(game, text, bot.id);
+  const previousFocus = bot.botBrain.focusTargetId ? alive(game).find((p) => p.id === bot.botBrain?.focusTargetId) : undefined;
+  const isFollowUp = /^(왜|왜\?|이유|근거|진짜|확실|그래서|그럼)/.test(text.replace(new RegExp(`^${bot.nickname}(아|야|님)?\\s*`), '').trim());
+  const freshTarget = roleTeam(bot.roleId) === 'killer' ? chooseKillerVictim(game, bot) : chooseCitizenBotTarget(game, bot);
+  const defaultTarget = isFollowUp && previousFocus ? previousFocus : freshTarget;
+  const target = mentioned || defaultTarget;
+  if (target) bot.botBrain.focusTargetId = target.id;
+  const lower = text.toLowerCase();
+
+  const asksRole = /(역할|직업|정체).*(뭐|뭔|무엇|알려|까|말)|너.*(뭐야|뭔데|무슨 역할|경찰|의사|시민|살인마|스파이|공범|탐정|시장)/.test(text);
+  if (asksRole) {
+    if (roleTeam(bot.roleId) === 'killer') return pick([
+      '나는 시민 쪽이야. 정확한 역할은 지금 공개 안 할게.',
+      '살인마 진영은 아니야. 역할 이름까지 까는 건 아직 위험해 보여.',
+      '시민 쪽이라고만 말할게. 지금 역할 공개는 보류하고 싶어.',
+    ]);
+    if (bot.roleId === 'citizen' || bot.roleId === 'ghost') return '나는 시민 진영이야. 지금은 역할 이름까지 공개할 필요는 없다고 봐.';
+    const strong = freshestUsefulClue(bot);
+    if (strong && game.settings.botDifficulty === 'HARD') return '시민 진영의 능력 역할이야. 정보가 있어서 정확한 역할은 조금만 더 숨길게.';
+    return '시민 진영이야. 능력 역할인지까지는 지금 공개하지 않을게.';
+  }
+
+  const asksWhoSuspect = /(누구|누굴|누가).*(의심|수상|살인마|찍|투표)|의심.*(누구|누굴|누가)|1순위|제일.*수상/.test(text);
+  if (asksWhoSuspect && target) {
+    return `지금은 ${target.nickname}님을 제일 의심해. ${reasonForSuspicion(game, bot, target)}.`;
+  }
+
+  const asksAboutMe = /(나|나를|내가|나는|난).*(의심|수상|어때|믿|살인마|뭐 같|어떻게 봐)|너.*나.*(의심|어때|믿|어떻게 봐)/.test(text);
+  if (asksAboutMe && asker) {
+    const score = suspicionScore(bot, asker);
+    if (score >= 12) return `${asker.nickname}님도 조금 의심하고 있어. ${reasonForSuspicion(game, bot, asker)}.`;
+    if (score <= -8) return `${asker.nickname}님은 지금은 비교적 덜 의심해. 다만 완전히 확정한 건 아니야.`;
+    return `${asker.nickname}님은 아직 반반이야. 지금 나온 정보만으로는 시민이라고도 살인마라고도 못 박겠어.`;
+  }
+
+  const asksWhy = /^(왜|왜\?)|(왜|이유|근거).*(의심|수상|찍|투표)|왜.*(그래|그렇게|걔|쟤)/.test(text);
+  if (asksWhy) {
+    const whyTarget = mentioned || defaultTarget;
+    if (whyTarget) {
+      const clue = latestClueAbout(bot, whyTarget.id);
+      if (clue?.resultCode === 'CITIZEN') return `${whyTarget.nickname}님은 오히려 덜 의심해. 내 정보로는 시민 쪽에 가까워 보여.`;
+      return `${whyTarget.nickname}님을 보는 이유는 ${reasonForSuspicion(game, bot, whyTarget)}야.`;
+    }
+    return '아직 확실한 근거는 없어. 그래서 지금은 한 명을 단정하기보다 발언이랑 투표 흐름을 더 보려는 중이야.';
+  }
+
+  const asksNight = /(어젯밤|밤에|밤).*?(누구|누굴|뭐|무엇|행동|조사|보호|추적|봤|했)/.test(text);
+  if (asksNight) {
+    const action = game.nightActions[bot.id];
+    const actionTarget = action ? game.players.find((p) => p.id === action.targetPlayerId) : undefined;
+    const clue = [...bot.privateClues].reverse().find((c) => c.round === game.round || c.round === game.round - 1);
+    if (roleTeam(bot.roleId) === 'killer') return '밤 행동은 지금 공개 안 할게. 그걸 바로 까면 살인마가 정보 역할을 찾기 너무 쉬워져.';
+    if (clue?.resultCode === 'KILLER' && clue.targetPlayerId) {
+      const t = game.players.find((p) => p.id === clue.targetPlayerId);
+      if (t) return `이건 말할 가치가 있어. ${t.nickname}님 쪽에서 아주 강하게 수상한 결과가 나왔어.`;
+    }
+    if (clue?.resultCode === 'CITIZEN' && clue.targetPlayerId) {
+      const t = game.players.find((p) => p.id === clue.targetPlayerId);
+      if (t) return `${t.nickname}님은 내가 가진 정보로는 시민 쪽에 가까워 보여.`;
+    }
+    if (actionTarget && game.settings.botDifficulty !== 'EASY') return `어젯밤 ${actionTarget.nickname}님 쪽을 확인했어. 결과까지 전부 공개할지는 조금 더 보고 말할게.`;
+    return '밤에 한 행동이 있더라도 지금 전부 공개하진 않을게. 필요한 정보가 생기면 힌트로 말할게.';
+  }
+
+  const asksVote = /(누구|누굴).*(투표|찍)|투표.*(누구|누굴)|누구한테.*표/.test(text);
+  if (asksVote && target) return `지금 투표라면 ${target.nickname}님 쪽으로 갈 생각이야. ${reasonForSuspicion(game, bot, target)}.`;
+
+  const asksOpinionOnNamed = !!mentioned && /(어때|생각|수상|의심|믿|어떻게 봐|어케 봐)/.test(text);
+  if (asksOpinionOnNamed && mentioned) {
+    const score = suspicionScore(bot, mentioned);
+    if (score >= 10) return `${mentioned.nickname}님은 꽤 수상하게 보고 있어. ${reasonForSuspicion(game, bot, mentioned)}.`;
+    if (score <= -8) return `${mentioned.nickname}님은 현재는 덜 의심해. 내 정보와 지금까지 흐름상 우선순위가 낮아.`;
+    return `${mentioned.nickname}님은 아직 애매해. 더 말 들어보고 투표 직전에 판단하고 싶어.`;
+  }
+
+  const asksGeneralOpinion = /(생각|의견|어때|어떻게 봐|어케 봐|뭐 같)/.test(text) || lower.endsWith('?');
+  if (asksGeneralOpinion && target) {
+    return `내 생각은 지금 ${target.nickname}님을 한 번 더 확인해야 한다는 쪽이야. ${reasonForSuspicion(game, bot, target)}.`;
+  }
+
+  if (text.includes(bot.nickname)) {
+    if (/(수상|의심|살인마|거짓)/.test(text) && target) return `나를 의심할 수는 있어. 근데 내 쪽만 보지 말고 ${target.nickname}님 발언도 같이 봐줘. ${reasonForSuspicion(game, bot, target)}.`;
+    return target ? `응, 보고 있어. 지금 내 1순위는 ${target.nickname}님이야. 궁금한 거 있으면 더 물어봐.` : '응. 지금 정보가 많진 않아서 조금 더 듣고 판단할게.';
+  }
+
+  return target ? `질문에 답하면, 지금은 ${target.nickname}님 쪽을 가장 확인하고 싶어. 아직 확정은 아니야.` : '지금은 확정할 사람이 없어. 나온 정보부터 하나씩 맞춰보자.';
+}
+
 function botDiscussionMessage(game: StoredGame, bot: Player): string {
   bot.botBrain ||= initBrain();
   const profile = botProfile(game.settings.botDifficulty);
   const others = aliveOthers(game, bot.id);
   const target = roleTeam(bot.roleId) === 'killer' ? chooseKillerVictim(game, bot) : chooseCitizenBotTarget(game, bot);
-  const lastHuman = [...game.chatMessages].reverse().find((m) => !m.system && !m.isBot && m.round === game.round);
-  const botWasMentioned = lastHuman?.message.includes(bot.nickname);
+  if (target) bot.botBrain.focusTargetId = target.id;
   const clue = freshestUsefulClue(bot);
 
   if (clue && Math.random() < profile.logic) {
@@ -663,12 +797,6 @@ function botDiscussionMessage(game: StoredGame, bot: Player): string {
       ]);
     }
   }
-
-  if (botWasMentioned && target) return pick([
-    `나도 확정은 못 해. 지금은 ${target.nickname}님 쪽이 더 걸려서 그쪽부터 보고 있어.`,
-    `내 생각은 ${target.nickname}님이 제일 의심스러워. 근거 더 나오면 바꿀 수도 있어.`,
-    `나한테 물어본 거면, 지금 1순위는 ${target.nickname}님이야.`,
-  ]);
 
   const accuser = [...game.chatMessages].reverse().find((m) => !m.system && m.playerId !== bot.id && m.message.includes(bot.nickname) && /(의심|수상|살인마|이상)/.test(m.message));
   if (accuser && target && Math.random() < 0.7) return pick([
@@ -701,17 +829,50 @@ function runBotDiscussion(game: StoredGame, bot: Player) {
   if (game.phase !== 'DISCUSSION' || bot.status !== 'ALIVE') return;
   const profile = botProfile(game.settings.botDifficulty);
   bot.botBrain ||= initBrain();
-  if (bot.botBrain.discussionChatCount >= profile.maxChats) return;
+
+  const pending = bot.botBrain.pendingReplyMessageId
+    ? game.chatMessages.find((m) => m.id === bot.botBrain?.pendingReplyMessageId && !m.system && !m.isBot && m.round === game.round)
+    : undefined;
+
+  if (!pending && bot.botBrain.discussionChatCount >= profile.maxChats) return;
   maybeRevealBotMayor(game, bot);
-  const message = botDiscussionMessage(game, bot);
+
+  const message = pending ? directBotAnswer(game, bot, pending) : botDiscussionMessage(game, bot);
   const chat: ChatMessage = {
     id: id(), playerId: bot.id, nickname: bot.nickname, message, timestamp: now(), round: game.round, isBot: true,
+    replyToMessageId: pending?.id,
   };
   game.chatMessages.push(chat);
-  bot.botBrain.discussionChatCount += 1;
+  if (game.chatMessages.length > 240) game.chatMessages.splice(0, game.chatMessages.length - 240);
+  bot.botBrain.discussionChatCount += pending ? 0 : 1;
   bot.botBrain.lastChatAt = now();
   bot.botBrain.nextChatAt = now() + rand(profile.chatMin, profile.chatMax) * 1000;
+  if (pending) {
+    bot.botBrain.lastReplyMessageId = pending.id;
+    bot.botBrain.pendingReplyMessageId = undefined;
+  }
   updateBrainsFromChat(game, chat);
+}
+
+function runBotGhostWhisper(game: StoredGame, bot: Player) {
+  if (game.phase !== 'DISCUSSION' || bot.status !== 'DEAD' || bot.roleId !== 'ghost' || (bot.ghostWhispersRemaining || 0) <= 0) return;
+  bot.botBrain ||= initBrain();
+  const target = chooseCitizenBotTarget(game, bot);
+  if (!target) return;
+  const clue = latestClueAbout(bot, target.id);
+  let message = `${target.nickname}님을 한 번 더 봐줘. 내가 살아 있을 때부터 조금 걸렸어.`;
+  if (clue?.resultCode === 'KILLER') message = `${target.nickname}님을 꼭 의심해봐. 내가 남길 수 있는 가장 강한 힌트야.`;
+  else if (clue?.resultCode === 'CITIZEN') message = `${target.nickname}님보다 다른 사람을 먼저 봐줘. 이건 내가 남기는 힌트야.`;
+  else if ((bot.botBrain.suspicion[target.id] || 0) > 10) message = `${target.nickname}님 쪽 발언과 투표 흐름을 다시 확인해봐.`;
+
+  const chat: ChatMessage = {
+    id: id(), playerId: 'GHOST', nickname: '유령의 속삭임', message, timestamp: now(), round: game.round, ghost: true,
+  };
+  game.chatMessages.push(chat);
+  updateBrainsFromChat(game, chat);
+  bot.ghostWhispersRemaining = Math.max(0, (bot.ghostWhispersRemaining || 0) - 1);
+  bot.botBrain.nextChatAt = now() + rand(22, 40) * 1000;
+  addEvent(game, '유령의 속삭임', '탈락한 유령이 익명의 힌트를 남겼습니다.', 'ability');
 }
 
 function allNightActionsDone(game: GameState): boolean {
@@ -739,6 +900,9 @@ function tickGame(game: StoredGame) {
   if (game.phase === 'DISCUSSION') {
     for (const bot of game.players.filter((p) => p.isBot && p.status === 'ALIVE')) {
       if ((bot.botBrain?.nextChatAt || Infinity) <= t) runBotDiscussion(game, bot);
+    }
+    for (const ghost of game.players.filter((p) => p.isBot && p.status === 'DEAD' && p.roleId === 'ghost' && (p.ghostWhispersRemaining || 0) > 0)) {
+      if ((ghost.botBrain?.nextChatAt || Infinity) <= t) runBotGhostWhisper(game, ghost);
     }
   }
   if (game.phase === 'VOTE') {
@@ -803,7 +967,10 @@ function publicPlayer(game: StoredGame, player: Player, viewerId?: string): Play
     delete copy.roleId;
     delete copy.role;
   }
-  if (player.id !== viewerId) copy.privateClues = [];
+  if (player.id !== viewerId) {
+    copy.privateClues = [];
+    delete copy.ghostWhispersRemaining;
+  }
   return copy;
 }
 
@@ -932,6 +1099,17 @@ app.post('/api/games/:gameId/host/fill-bots', (req, res) => {
   res.json({ game: sanitize(game, host.id) });
 });
 
+app.post('/api/games/:gameId/host/remove-bots', (req, res) => {
+  const game = requireGame(req, res); if (!game) return;
+  const host = requireHost(game, req.body.playerId, res); if (!host) return;
+  if (game.status !== 'LOBBY') return res.status(409).json({ error: '로비에서만 BOT을 뺄 수 있습니다.' });
+  game.players = game.players.filter((p) => !p.isBot);
+  game.lobbyAutoStartAt = null;
+  game.updatedAt = now();
+  persistSoon();
+  res.json({ game: sanitize(game, host.id) });
+});
+
 app.post('/api/games/:gameId/host/settings', (req, res) => {
   const game = requireGame(req, res); if (!game) return;
   const host = requireHost(game, req.body.playerId, res); if (!host) return;
@@ -963,12 +1141,55 @@ app.post('/api/games/:gameId/chat', (req, res) => {
   game.chatMessages.push(chat);
   if (game.chatMessages.length > 240) game.chatMessages.splice(0, game.chatMessages.length - 240);
   updateBrainsFromChat(game, chat);
-  const profile = botProfile(game.settings.botDifficulty);
-  const responsiveBots = shuffle(game.players.filter((x) => x.isBot && x.status === 'ALIVE')).slice(0, game.settings.botDifficulty === 'HARD' ? 2 : 1);
-  for (const bot of responsiveBots) {
+
+  // Human questions get priority over BOT monologues. If a BOT name is mentioned,
+  // that BOT is the primary responder. General questions get one or two responders.
+  const livingBots = game.players.filter((x) => x.isBot && x.status === 'ALIVE');
+  const trimmedMessage = message.trim();
+  const addressedBot = livingBots.find((x) =>
+    trimmedMessage.startsWith(x.nickname) ||
+    trimmedMessage.includes(`@${x.nickname}`) ||
+    trimmedMessage.includes(`${x.nickname}아`) ||
+    trimmedMessage.includes(`${x.nickname}야`)
+  );
+  const question = isQuestionLike(message);
+  let responsiveBots: Player[] = [];
+  if (addressedBot) responsiveBots = [addressedBot];
+  else if (question) responsiveBots = shuffle(livingBots).slice(0, game.settings.botDifficulty === 'HARD' ? 2 : 1);
+  else responsiveBots = shuffle(livingBots).slice(0, 1);
+
+  const responseDelay = game.settings.botDifficulty === 'HARD' ? [1, 2] : game.settings.botDifficulty === 'EASY' ? [2, 4] : [1, 3];
+  const responsiveIds = new Set(responsiveBots.map((x) => x.id));
+  for (const bot of livingBots) {
     bot.botBrain ||= initBrain();
-    bot.botBrain.nextChatAt = Math.min(bot.botBrain.nextChatAt || Infinity, now() + rand(2, Math.max(3, Math.floor(profile.chatMin / 2))) * 1000);
+    if (responsiveIds.has(bot.id)) {
+      bot.botBrain.pendingReplyMessageId = chat.id;
+      bot.botBrain.nextChatAt = Math.min(bot.botBrain.nextChatAt || Infinity, now() + rand(responseDelay[0], responseDelay[1]) * 1000);
+    } else if (question || addressedBot) {
+      // Other BOTs wait so the direct answer is not buried under unrelated chatter.
+      bot.botBrain.nextChatAt = Math.max(bot.botBrain.nextChatAt || 0, now() + rand(5, 8) * 1000);
+    }
   }
+  persistSoon();
+  res.json({ game: sanitize(game, p.id) });
+});
+
+app.post('/api/games/:gameId/ghost-whisper', (req, res) => {
+  const game = requireGame(req, res); if (!game) return;
+  const p = requirePlayer(game, req.body.playerId, res); if (!p) return;
+  if (game.status !== 'PLAYING' || game.phase !== 'DISCUSSION') return res.status(409).json({ error: '낮 대화 시간에만 유령의 힌트를 남길 수 있습니다.' });
+  if (p.status !== 'DEAD' || p.roleId !== 'ghost') return res.status(400).json({ error: '탈락한 유령만 사용할 수 있는 능력입니다.' });
+  if ((p.ghostWhispersRemaining || 0) <= 0) return res.status(409).json({ error: '유령의 속삭임을 모두 사용했습니다.' });
+  const message = String(req.body.message || '').trim().slice(0, 50);
+  if (!message) return res.status(400).json({ error: '힌트를 입력해주세요.' });
+  const chat: ChatMessage = {
+    id: id(), playerId: 'GHOST', nickname: '유령의 속삭임', message, timestamp: now(), round: game.round, ghost: true,
+  };
+  game.chatMessages.push(chat);
+  if (game.chatMessages.length > 240) game.chatMessages.splice(0, game.chatMessages.length - 240);
+  updateBrainsFromChat(game, chat);
+  p.ghostWhispersRemaining = Math.max(0, (p.ghostWhispersRemaining || 0) - 1);
+  addEvent(game, '유령의 속삭임', '탈락한 유령이 익명의 힌트를 남겼습니다.', 'ability');
   persistSoon();
   res.json({ game: sanitize(game, p.id) });
 });
@@ -1036,6 +1257,12 @@ app.post('/api/games/:gameId/host/toggle-pause', (req, res) => {
 app.post('/api/games/:gameId/host/return-lobby', (req, res) => {
   const game = requireGame(req, res); if (!game) return;
   const host = requireHost(game, req.body.playerId, res); if (!host) return;
+  const keepBots = req.body.keepBots !== false;
+
+  // A rematch always pauses in the lobby first. This gives late friends time to join.
+  // If BOTs are kept and a human joins a full lobby, join() replaces one BOT automatically.
+  if (!keepBots) game.players = game.players.filter((p) => !p.isBot);
+
   game.status = 'LOBBY';
   game.round = 0;
   game.phase = 'ROLE_REVEAL';
@@ -1052,8 +1279,16 @@ app.post('/api/games/:gameId/host/return-lobby', (req, res) => {
   game.lastNightResult = null;
   game.lastExecutionResult = null;
   game.players.forEach((p) => {
-    p.status = 'ALIVE'; delete p.roleId; delete p.role; p.revealedRole = false; p.mayorRevealed = false; p.privateClues = []; if (p.isBot) p.botBrain = initBrain();
+    p.status = 'ALIVE';
+    delete p.roleId;
+    delete p.role;
+    p.revealedRole = false;
+    p.mayorRevealed = false;
+    p.ghostWhispersRemaining = 0;
+    p.privateClues = [];
+    if (p.isBot) p.botBrain = initBrain();
   });
+  game.updatedAt = now();
   persistSoon();
   res.json({ game: sanitize(game, host.id) });
 });
@@ -1072,7 +1307,7 @@ async function startServer() {
     app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
   }
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Killer Game Mafia v6 running on port ${PORT}`);
+    console.log(`Killer Game Mafia v8 running on port ${PORT}`);
     console.log(`[store] ${DATA_FILE}`);
   });
 }
