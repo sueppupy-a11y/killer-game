@@ -1,0 +1,6 @@
+{
+  "name": "살인자 게임 (The Killer Game)",
+  "description": "12인 오프라인 마피아 및 추리 게임 보조 웹앱 - 방송 재현 모드, 방 이동, 경찰 체포 시스템 지원",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
