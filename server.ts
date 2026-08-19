@@ -1,2425 +1,1079 @@
-import express, { Request, Response } from 'express';
+import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import {
-  GameState,
-  Player,
-  GameLogEntry,
-  TeamType,
-  RoomId,
-  RoomLocation,
-  GameMode,
-  PlayerStatus,
+  BotBrain,
+  BotDifficulty,
+  ChatMessage,
+  ExecutionResult,
+  GameEvent,
+  GamePhase,
   GameSettings,
+  GameState,
+  NightAction,
+  NightActionType,
+  NightResult,
+  Player,
+  PrivateClue,
+  RoleId,
+  TeamType,
+  VoteEntry,
 } from './src/types';
-import { ROLES_DATA, FIXED_ROLES_PRESET, ROLE_IDS_POOL, ALL_ROOMS } from './src/rolesData';
+import { ROLE_POOL, ROLES } from './src/rolesData';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), '.data');
-const DATA_FILE = path.join(DATA_DIR, 'games.json');
+const DATA_FILE = path.join(DATA_DIR, 'games-v6.json');
+const MAX_PLAYERS = 12;
+const GAME_VERSION = 6;
 
 app.use(express.json());
 
-// Persist every successful game mutation without sprinkling file writes across all routes.
-app.use('/api/games', (req, res, next) => {
-  if (req.method !== 'GET') {
-    res.on('finish', () => {
-      if (res.statusCode < 500) persistGamesSoon();
-    });
-  }
-  next();
-});
-
-// Shared game store. Kept in memory for speed and mirrored to disk so a single-server deployment
-// can survive ordinary process restarts. For multi-instance scaling, replace this with Redis/DB.
-type BotBrainState = {
-  discussionRound?: number;
-  messagesThisDiscussion?: number;
-  nextChatAt?: number | null;
-  abilityRound?: number;
-  nextAbilityAt?: number | null;
-  lastRoom?: RoomLocation | null;
-  lastRoomRound?: number;
-  lastPsychicCount?: number | null;
-  lastPoliceAlert?: boolean;
-  lastVictimNickname?: string | null;
-  lastMurderRound?: number | null;
-  suspicion?: Record<string, number>;
-  lastMessageKind?: string | null;
-};
-
 type StoredGame = GameState & {
-  pendingForensicEvents?: Array<{ round: number; victimNickname: string; room: RoomLocation }>;
-  botBrains?: Record<string, BotBrainState>;
+  version: number;
+  pausedRemainingMs?: number | null;
 };
+
 const games: Record<string, StoredGame> = {};
 
-function loadGamesFromDisk() {
+const DEFAULT_SETTINGS: GameSettings = {
+  botDifficulty: 'NORMAL',
+  roleRevealOnDeath: true,
+  roleRevealSeconds: 7,
+  nightSeconds: 22,
+  morningSeconds: 8,
+  discussionSeconds: 60,
+  voteSeconds: 20,
+  executionSeconds: 8,
+  autoStartDelaySeconds: 10,
+};
+
+const BOT_NAMES = [
+  '민준', '서연', '지호', '유나', '도윤', '하린', '준서', '수아', '현우', '예린', '태윤', '나은',
+  '시우', '채원', '건우', '다인', '우진', '세아', '재현', '아린', '정우', '소윤', '하준', '지아',
+];
+
+function now() { return Date.now(); }
+function id() { return Math.random().toString(36).slice(2, 10) + now().toString(36); }
+function rand(min: number, max: number) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+function pick<T>(items: T[]): T { return items[Math.floor(Math.random() * items.length)]; }
+function shuffle<T>(input: T[]): T[] {
+  const a = [...input];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function loadGames() {
   try {
     if (!fs.existsSync(DATA_FILE)) return;
-    const raw = fs.readFileSync(DATA_FILE, 'utf8');
-    if (!raw.trim()) return;
-    const parsed = JSON.parse(raw) as Record<string, StoredGame>;
-    Object.values(parsed).forEach((game) => {
-      if (!game.chatMessages) game.chatMessages = [];
-      if (!game.botBrains) game.botBrains = {};
-    });
-    Object.assign(games, parsed);
-    console.log(`[store] restored ${Object.keys(parsed).length} game(s) from ${DATA_FILE}`);
-  } catch (error) {
-    console.error('[store] failed to restore games:', error);
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) as Record<string, StoredGame>;
+    for (const [code, game] of Object.entries(parsed)) {
+      if (game.version !== GAME_VERSION) continue;
+      game.settings = { ...DEFAULT_SETTINGS, ...(game.settings || {}) };
+      game.chatMessages ||= [];
+      game.events ||= [];
+      game.nightActions ||= {};
+      game.votes ||= {};
+      game.lastNightResult ||= null;
+      game.lastExecutionResult ||= null;
+      games[code] = game;
+    }
+    console.log(`[store] restored ${Object.keys(games).length} v6 game(s)`);
+  } catch (e) {
+    console.error('[store] restore failed', e);
   }
 }
 
 let persistTimer: NodeJS.Timeout | null = null;
-function persistGamesSoon() {
+function persistSoon() {
   if (persistTimer) return;
   persistTimer = setTimeout(() => {
     persistTimer = null;
     try {
       fs.mkdirSync(DATA_DIR, { recursive: true });
-      const tempFile = `${DATA_FILE}.tmp`;
-      fs.writeFileSync(tempFile, JSON.stringify(games), 'utf8');
-      fs.renameSync(tempFile, DATA_FILE);
-    } catch (error) {
-      console.error('[store] failed to persist games:', error);
+      const tmp = `${DATA_FILE}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(games), 'utf8');
+      fs.renameSync(tmp, DATA_FILE);
+    } catch (e) {
+      console.error('[store] persist failed', e);
     }
-  }, 100);
+  }, 80);
 }
 
-loadGamesFromDisk();
+loadGames();
 
-function generateGameCode(): string {
+function gameCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
-  for (let i = 0; i < 6; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
+  do {
+    code = Array.from({ length: 6 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+  } while (games[code]);
   return code;
 }
 
-function generateId(): string {
-  return Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+function roleTeam(roleId?: RoleId): TeamType | null {
+  return roleId ? ROLES[roleId].team : null;
 }
 
-function shuffleArray<T>(array: T[]): T[] {
-  const arr = [...array];
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
+function alive(game: GameState): Player[] {
+  return game.players.filter((p) => p.status === 'ALIVE');
+}
+
+function aliveOthers(game: GameState, playerId: string): Player[] {
+  return alive(game).filter((p) => p.id !== playerId);
+}
+
+function activeKiller(game: GameState): Player | null {
+  const priority: RoleId[] = ['killer', 'accomplice', 'spy'];
+  for (const r of priority) {
+    const p = game.players.find((x) => x.status === 'ALIVE' && x.roleId === r);
+    if (p) return p;
   }
-  return arr;
+  return null;
 }
 
-const DEFAULT_SETTINGS: GameSettings = {
-  maxRounds: 10,
-  preDiscussionTimeSeconds: 60, // 1분 사전 대화
-  roomSelectionTimeSeconds: 15, // 15초 방 선택 제한
-  abilityActionTimeSeconds: 15, // 방 선택 후 특수능력 선택 시간
-  dayResultTimeSeconds: 8, // 낮 결과 발표 후 자동 다음 라운드까지
-  allowRoleAbilities: true,
-  killerWinConditionText: '총 3회 살인 성공 또는 10라운드 생존/최종 투표 승리',
-  citizenWinConditionText: '경찰이 진짜 살인마를 체포하거나 최종 투표에서 살인마 검거',
-  neutralWinConditionText: '소매치기(3회 절도+생존), 사이코패스(살인3회+생존), 도박꾼(베팅적중+생존)',
-  autoAdvanceRound: true,
-  botDifficulty: 'NORMAL',
-};
+function requiredNightAction(game: GameState, player: Player): NightActionType | null {
+  if (player.status !== 'ALIVE' || game.phase !== 'NIGHT') return null;
+  const killer = activeKiller(game);
+  if (killer?.id === player.id) return 'KILL';
+  switch (player.roleId) {
+    case 'spy': return 'SPY_SCAN';
+    case 'accomplice': return 'BLOCK';
+    case 'police': return 'POLICE_CHECK';
+    case 'doctor': return 'HEAL';
+    case 'bodyguard': return 'GUARD';
+    case 'detective': return 'TRACK';
+    case 'psychic': return 'SENSE';
+    default: return null;
+  }
+}
 
-// Older persisted rooms may not have newly added phase timing settings.
-Object.values(games).forEach((game) => {
-  game.settings = { ...DEFAULT_SETTINGS, ...(game.settings || {}) };
-  if (!game.chatMessages) game.chatMessages = [];
-  if (!(game as StoredGame).botBrains) (game as StoredGame).botBrains = {};
-});
+function validTargets(game: GameState, actor: Player, type: NightActionType): Player[] {
+  let candidates = alive(game);
+  if (type !== 'HEAL') candidates = candidates.filter((p) => p.id !== actor.id);
+  if (type === 'KILL' || type === 'SPY_SCAN' || type === 'BLOCK') {
+    candidates = candidates.filter((p) => roleTeam(p.roleId) !== 'killer');
+  }
+  return candidates;
+}
 
-function addGameLog(
-  game: GameState,
-  message: string,
-  type: 'info' | 'death' | 'arrest' | 'win' | 'phase' | 'police' | 'warden' | 'steal' = 'info'
-) {
-  const log: GameLogEntry = {
-    id: generateId(),
-    round: game.round,
-    message,
-    timestamp: Date.now(),
-    type,
+function addEvent(game: GameState, title: string, body: string, type: GameEvent['type'] = 'info') {
+  const event: GameEvent = { id: id(), round: game.round, phase: game.phase, title, body, type, timestamp: now() };
+  game.events.unshift(event);
+  if (game.events.length > 80) game.events.length = 80;
+}
+
+function addSystemChat(game: GameState, message: string) {
+  const chat: ChatMessage = {
+    id: id(), playerId: 'SYSTEM', nickname: '게임 진행', message, timestamp: now(), round: game.round, isBot: false, system: true,
   };
-  game.logs.unshift(log);
-  if (game.logs.length > 100) game.logs.pop();
+  game.chatMessages.push(chat);
+  if (game.chatMessages.length > 240) game.chatMessages.splice(0, game.chatMessages.length - 240);
 }
 
-// ================= RULE-BASED BOT ENGINE =================
-// Bots only reason from public chat + their own private state. Target selection never reads another
-// player's hidden role. This keeps HARD bots stronger without turning them into cheating bots.
-const BOT_NAME_POOL = [
-  '민준', '서연', '지호', '유나', '도윤', '하린', '준서', '수아', '현우', '예린', '태윤', '나은',
-  '시우', '채원', '건우', '다인', '우진', '세아', '재현', '아린', '정우', '소윤', '하준', '지아',
-];
+function addPrivateClue(player: Player, clue: Omit<PrivateClue, 'id' | 'createdAt'>) {
+  player.privateClues.push({ ...clue, id: id(), createdAt: now() });
+  if (player.privateClues.length > 30) player.privateClues.splice(0, player.privateClues.length - 30);
+}
 
-type BotDifficulty = GameSettings['botDifficulty'];
-
-type BotProfile = {
-  minMessages: number;
-  maxMessages: number;
-  initialDelayMin: number;
-  initialDelayMax: number;
-  gapMin: number;
-  gapMax: number;
-  evidenceShareChance: number;
-  questionChance: number;
-};
-
-function botProfile(difficulty: BotDifficulty): BotProfile {
-  if (difficulty === 'EASY') {
-    return {
-      minMessages: 1,
-      maxMessages: 2,
-      initialDelayMin: 5,
-      initialDelayMax: 16,
-      gapMin: 14,
-      gapMax: 26,
-      evidenceShareChance: 0.2,
-      questionChance: 0.2,
-    };
-  }
-  if (difficulty === 'HARD') {
-    return {
-      minMessages: 3,
-      maxMessages: 4,
-      initialDelayMin: 2,
-      initialDelayMax: 7,
-      gapMin: 8,
-      gapMax: 15,
-      evidenceShareChance: 0.72,
-      questionChance: 0.55,
-    };
-  }
+function initBrain(): BotBrain {
   return {
-    minMessages: 2,
-    maxMessages: 3,
-    initialDelayMin: 3,
-    initialDelayMax: 10,
-    gapMin: 10,
-    gapMax: 19,
-    evidenceShareChance: 0.45,
-    questionChance: 0.38,
+    suspicion: {}, lastChatAt: 0, nextChatAt: 0, nextActionAt: 0,
+    discussionChatCount: 0, lastProcessedChatAt: 0, roleClaims: {}, sharedClueIds: [],
+  } as BotBrain;
+}
+
+function createPlayer(nickname: string, isHost = false, isBot = false): Player {
+  return {
+    id: id(), nickname, isHost, isBot, status: 'ALIVE', joinedAt: now(),
+    privateClues: [], botBrain: isBot ? initBrain() : undefined,
   };
 }
 
-function randInt(min: number, max: number): number {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
+function normalizeNickname(raw: unknown): string {
+  return String(raw || '').trim().slice(0, 16);
 }
 
-function pickOne<T>(items: T[]): T {
-  return items[Math.floor(Math.random() * items.length)];
+function botProfile(diff: BotDifficulty) {
+  if (diff === 'EASY') return { maxChats: 2, chatMin: 12, chatMax: 24, actionMin: 6, actionMax: 15, logic: 0.35 };
+  if (diff === 'HARD') return { maxChats: 4, chatMin: 5, chatMax: 11, actionMin: 2, actionMax: 7, logic: 0.9 };
+  return { maxChats: 3, chatMin: 8, chatMax: 16, actionMin: 3, actionMax: 10, logic: 0.65 };
 }
 
-function ensureBotBrain(game: GameState, playerId: string): BotBrainState {
-  const stored = game as StoredGame;
-  if (!stored.botBrains) stored.botBrains = {};
-  if (!stored.botBrains[playerId]) {
-    stored.botBrains[playerId] = {
-      suspicion: {},
-      messagesThisDiscussion: 0,
-      nextChatAt: null,
-      nextAbilityAt: null,
-      lastMessageKind: null,
-    };
-  }
-  const brain = stored.botBrains[playerId];
-  if (!brain.suspicion) brain.suspicion = {};
-  return brain;
-}
-
-function aliveTargets(game: GameState, bot: Player): Player[] {
-  return game.players.filter((p) => p.status === 'ALIVE' && p.id !== bot.id);
-}
-
-function extractRoomClaims(message: string): RoomId[] {
-  const text = message.toUpperCase();
-  const found = new Set<RoomId>();
-  const regex = /\b([A-F])\s*(?:ROOM|방)\b/g;
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(text))) found.add(match[1] as RoomId);
-  return [...found];
-}
-
-const ACCUSATION_WORDS = ['의심', '수상', '거짓', '말바꿨', '말 바꿨', '이상', '범인', '살인마', '구라', '모순'];
-
-function messageLooksAccusatory(message: string): boolean {
-  return ACCUSATION_WORDS.some((word) => message.includes(word));
-}
-
-function buildSuspicionScores(game: GameState, bot: Player, brain: BotBrainState): Record<string, number> {
-  const difficulty = game.settings.botDifficulty || 'NORMAL';
-  const targets = aliveTargets(game, bot);
-  const scores: Record<string, number> = {};
-  const recent = (game.chatMessages || []).filter(
-    (m) => m.round === game.round && m.phase === 'PRE_SELECTION_DISCUSSION'
-  );
-
-  for (const target of targets) {
-    let score = (brain.suspicion?.[target.id] || 0) * 0.55;
-    const authored = recent.filter((m) => m.playerId === target.id);
-    const claims = new Set<RoomId>();
-    authored.forEach((m) => extractRoomClaims(m.message).forEach((r) => claims.add(r)));
-
-    // A player changing their room claim in the same discussion is a strong visible contradiction.
-    if (claims.size >= 2) {
-      score += difficulty === 'HARD' ? 3.4 : difficulty === 'NORMAL' ? 2.2 : 0.9;
+function resetBotPhaseState(game: GameState, phase: GamePhase) {
+  const profile = botProfile(game.settings.botDifficulty);
+  for (const bot of game.players.filter((p) => p.isBot && p.status === 'ALIVE')) {
+    bot.botBrain ||= initBrain();
+    if (phase === 'DISCUSSION') {
+      bot.botBrain.discussionChatCount = 0;
+      bot.botBrain.nextChatAt = now() + rand(profile.chatMin, profile.chatMax) * 1000;
     }
+    if (phase === 'NIGHT' || phase === 'VOTE') {
+      bot.botBrain.nextActionAt = now() + rand(profile.actionMin, profile.actionMax) * 1000;
+    }
+  }
+}
 
-    // Public accusations from multiple players accumulate, but never become perfect evidence.
-    for (const msg of recent) {
-      if (msg.playerId === bot.id) continue;
-      if (msg.message.includes(target.nickname) && messageLooksAccusatory(msg.message)) {
-        score += difficulty === 'HARD' ? 0.9 : difficulty === 'NORMAL' ? 0.65 : 0.35;
+function beginPhase(game: StoredGame, phase: GamePhase, seconds: number) {
+  game.phase = phase;
+  game.phaseExpiresAt = now() + seconds * 1000;
+  game.updatedAt = now();
+  if (phase === 'NIGHT') {
+    game.nightActions = {};
+    game.votes = {};
+  }
+  if (phase === 'VOTE') game.votes = {};
+  resetBotPhaseState(game, phase);
+}
+
+function assignRoles(game: StoredGame) {
+  const roles = shuffle(ROLE_POOL);
+  const players = shuffle(game.players);
+  players.forEach((p, i) => {
+    p.roleId = roles[i];
+    p.role = ROLES[roles[i]];
+    p.status = 'ALIVE';
+    p.revealedRole = false;
+    p.mayorRevealed = false;
+    p.privateClues = [];
+    if (p.isBot) p.botBrain = initBrain();
+  });
+}
+
+function startInternal(game: StoredGame) {
+  if (game.players.length !== MAX_PLAYERS) return false;
+  assignRoles(game);
+  game.status = 'PLAYING';
+  game.round = 1;
+  game.winner = null;
+  game.winnerReason = null;
+  game.pendingWinner = null;
+  game.pendingWinnerReason = null;
+  game.lastNightResult = null;
+  game.lastExecutionResult = null;
+  game.chatMessages = [];
+  game.events = [];
+  game.lobbyAutoStartAt = null;
+  addEvent(game, '게임 시작', '각자의 역할을 확인하세요. 잠시 후 첫 번째 밤이 시작됩니다.', 'info');
+  beginPhase(game, 'ROLE_REVEAL', game.settings.roleRevealSeconds);
+  persistSoon();
+  return true;
+}
+
+function calculateWinner(game: GameState): { winner: TeamType; reason: string } | null {
+  const living = alive(game);
+  const killerCount = living.filter((p) => roleTeam(p.roleId) === 'killer').length;
+  const citizenCount = living.filter((p) => roleTeam(p.roleId) === 'citizen').length;
+  if (killerCount === 0) return { winner: 'citizen', reason: '살인마 진영이 모두 탈락했습니다.' };
+  if (killerCount >= citizenCount) return { winner: 'killer', reason: '살인마 진영의 수가 시민 진영과 같거나 많아졌습니다.' };
+  return null;
+}
+
+function queueWinnerIfNeeded(game: StoredGame) {
+  const result = calculateWinner(game);
+  if (result) {
+    game.pendingWinner = result.winner;
+    game.pendingWinnerReason = result.reason;
+  }
+}
+
+function finishPendingWinner(game: StoredGame): boolean {
+  if (!game.pendingWinner) return false;
+  game.status = 'GAME_OVER';
+  game.winner = game.pendingWinner;
+  game.winnerReason = game.pendingWinnerReason || '';
+  game.phaseExpiresAt = null;
+  game.players.forEach((p) => { p.revealedRole = true; });
+  addEvent(game, game.winner === 'citizen' ? '시민 진영 승리' : '살인마 진영 승리', game.winnerReason || '', 'win');
+  return true;
+}
+
+function actionTargetName(game: GameState, action?: NightAction): string | null {
+  if (!action) return null;
+  return game.players.find((p) => p.id === action.targetPlayerId)?.nickname || null;
+}
+
+function resolveNight(game: StoredGame) {
+  const killer = activeKiller(game);
+  if (killer && !game.nightActions[killer.id]) {
+    const choices = validTargets(game, killer, 'KILL');
+    if (choices.length) game.nightActions[killer.id] = { actorId: killer.id, type: 'KILL', targetPlayerId: pick(choices).id, submittedAt: now(), auto: true };
+  }
+
+  const actions = { ...game.nightActions };
+  const blockAction = Object.values(actions).find((a) => a.type === 'BLOCK');
+  const blockedId = blockAction?.targetPlayerId || null;
+  const effective = Object.values(actions).filter((a) => a.actorId !== blockedId);
+  const byType = (type: NightActionType) => effective.find((a) => a.type === type);
+
+  const kill = byType('KILL');
+  const heal = byType('HEAL');
+  const guard = byType('GUARD');
+  const deaths: Player[] = [];
+  let prevented = false;
+
+  if (kill) {
+    const victim = game.players.find((p) => p.id === kill.targetPlayerId && p.status === 'ALIVE');
+    if (victim) {
+      if (heal?.targetPlayerId === victim.id) {
+        prevented = true;
+      } else if (guard?.targetPlayerId === victim.id) {
+        const guardPlayer = game.players.find((p) => p.id === guard.actorId && p.status === 'ALIVE');
+        if (guardPlayer) {
+          if (heal?.targetPlayerId === guardPlayer.id) prevented = true;
+          else deaths.push(guardPlayer);
+        } else {
+          deaths.push(victim);
+        }
+      } else {
+        deaths.push(victim);
       }
     }
-
-    // Very active players get a tiny attention bump so HARD bots ask them for concrete claims.
-    score += Math.min(0.6, authored.length * (difficulty === 'HARD' ? 0.12 : 0.06));
-    score += Math.random() * (difficulty === 'EASY' ? 1.2 : difficulty === 'NORMAL' ? 0.65 : 0.35);
-    scores[target.id] = score;
   }
 
-  brain.suspicion = scores;
-  return scores;
+  for (const d of deaths) {
+    d.status = 'DEAD';
+    if (game.settings.roleRevealOnDeath) d.revealedRole = true;
+  }
+
+  for (const action of effective) {
+    const actor = game.players.find((p) => p.id === action.actorId);
+    const target = game.players.find((p) => p.id === action.targetPlayerId);
+    if (!actor || !target) continue;
+    if (action.type === 'POLICE_CHECK') {
+      const isKiller = roleTeam(target.roleId) === 'killer';
+      addPrivateClue(actor, {
+        round: game.round, source: '경찰 조사', targetPlayerId: target.id,
+        resultCode: isKiller ? 'KILLER' : 'CITIZEN',
+        text: `${target.nickname}님은 ${isKiller ? '🔴 살인마 진영' : '🟢 시민 진영'}입니다.`,
+      });
+    }
+    if (action.type === 'SPY_SCAN') {
+      const special = target.roleId !== 'citizen';
+      addPrivateClue(actor, {
+        round: game.round, source: '스파이 탐색', targetPlayerId: target.id,
+        resultCode: special ? 'SPECIAL' : 'PLAIN',
+        text: `${target.nickname}님은 ${special ? '특수능력을 가진 역할' : '일반 시민 역할'}입니다.`,
+      });
+    }
+    if (action.type === 'TRACK') {
+      const targetAction = effective.find((a) => a.actorId === target.id);
+      const visited = actionTargetName(game, targetAction);
+      addPrivateClue(actor, {
+        round: game.round, source: '탐정 추적', targetPlayerId: target.id,
+        resultCode: visited ? 'VISITED' : 'NO_ACTION',
+        text: visited ? `${target.nickname}님은 밤에 ${visited}님에게 행동했습니다.` : `${target.nickname}님은 밤에 아무에게도 능력을 사용하지 않았습니다.`,
+      });
+    }
+    if (action.type === 'SENSE') {
+      const targetAction = effective.find((a) => a.actorId === target.id);
+      addPrivateClue(actor, {
+        round: game.round, source: '초감각', targetPlayerId: target.id,
+        resultCode: targetAction ? 'ACTED' : 'NO_ACTION',
+        text: `${target.nickname}님에게서 ${targetAction ? '능력을 사용한 흔적이 감지되었습니다.' : '능력 사용 흔적이 감지되지 않았습니다.'}`,
+      });
+    }
+  }
+
+  const deathInfo = deaths.map((p) => ({
+    playerId: p.id,
+    nickname: p.nickname,
+    roleName: game.settings.roleRevealOnDeath && p.roleId ? ROLES[p.roleId].name : undefined,
+  }));
+  const message = deathInfo.length
+    ? `${deathInfo.map((d) => d.nickname).join(', ')}님이 지난밤 사망했습니다.`
+    : prevented ? '지난밤 공격이 있었지만 아무도 사망하지 않았습니다.' : '지난밤 아무도 사망하지 않았습니다.';
+
+  const result: NightResult = { round: game.round, deaths: deathInfo, prevented, message };
+  game.lastNightResult = result;
+  addEvent(game, '아침 결과', message, deathInfo.length ? 'death' : 'info');
+  addSystemChat(game, `☀️ ${message}`);
+  updateBrainsAfterNight(game, deaths);
+  queueWinnerIfNeeded(game);
 }
 
-function chooseSuspect(game: GameState, bot: Player, brain: BotBrainState): { player: Player | null; score: number } {
-  const scores = buildSuspicionScores(game, bot, brain);
-  const targets = aliveTargets(game, bot);
-  if (!targets.length) return { player: null, score: 0 };
-  const sorted = [...targets].sort((a, b) => (scores[b.id] || 0) - (scores[a.id] || 0));
-  return { player: sorted[0], score: scores[sorted[0].id] || 0 };
-}
-
-function chooseInfluentialTarget(game: GameState, bot: Player): Player | null {
-  const targets = aliveTargets(game, bot);
-  if (!targets.length) return null;
-  const recent = (game.chatMessages || []).filter((m) => m.round === game.round);
-  const activity: Record<string, number> = {};
-  targets.forEach((p) => (activity[p.id] = 0));
-  recent.forEach((m) => {
-    if (activity[m.playerId] !== undefined) activity[m.playerId] += 1;
+function resolveVote(game: StoredGame) {
+  for (const p of alive(game)) {
+    if (!game.votes[p.id] && p.isBot) runBotVote(game, p, true);
+  }
+  const counts: Record<string, number> = {};
+  const breakdown = Object.values(game.votes).map((v) => {
+    counts[v.targetPlayerId] = (counts[v.targetPlayerId] || 0) + v.weight;
+    const voter = game.players.find((p) => p.id === v.voterId)!;
+    const target = game.players.find((p) => p.id === v.targetPlayerId)!;
+    return { voterNickname: voter?.nickname || '?', targetNickname: target?.nickname || '?', weight: v.weight };
   });
-  return [...targets].sort((a, b) => {
-    const humanBonusA = a.isBot ? 0 : 1.2;
-    const humanBonusB = b.isBot ? 0 : 1.2;
-    return (activity[b.id] || 0) + humanBonusB - ((activity[a.id] || 0) + humanBonusA);
-  })[0];
-}
 
-function chooseClaimRoom(game: GameState, bot: Player, brain: BotBrainState): RoomLocation | null {
-  const actual = brain.lastRoom || null;
-  if (!actual) return null;
-  const difficulty = game.settings.botDifficulty || 'NORMAL';
-  const team = bot.roleId ? ROLES_DATA[bot.roleId]?.team : undefined;
-  let lieChance = 0.05;
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  let eliminated: Player | undefined;
+  let tied = false;
+  if (entries.length) {
+    const max = entries[0][1];
+    const top = entries.filter(([, score]) => score === max);
+    if (top.length === 1) eliminated = game.players.find((p) => p.id === top[0][0] && p.status === 'ALIVE');
+    else tied = true;
+  } else tied = true;
 
-  if (difficulty === 'EASY') {
-    lieChance = team === 'killer' ? 0.35 : 0.18;
-  } else if (difficulty === 'NORMAL') {
-    lieChance = team === 'killer' ? 0.52 : team === 'neutral' ? 0.16 : 0.05;
-  } else {
-    lieChance = team === 'killer' ? (brain.lastVictimNickname ? 0.72 : 0.48) : team === 'neutral' ? 0.12 : 0.02;
+  if (eliminated) {
+    eliminated.status = 'DEAD';
+    if (game.settings.roleRevealOnDeath) eliminated.revealedRole = true;
   }
 
-  if (Math.random() >= lieChance) return actual;
-  const pool: RoomLocation[] = [...ALL_ROOMS].filter((r) => r !== actual);
-  if (actual !== 'PRISON') pool.push('PRISON');
-  return pickOne(pool);
+  const message = eliminated
+    ? `${eliminated.nickname}님이 투표로 탈락했습니다.${game.settings.roleRevealOnDeath && eliminated.roleId ? ` 역할은 ${ROLES[eliminated.roleId].emoji} ${ROLES[eliminated.roleId].name}입니다.` : ''}`
+    : '최다 득표가 동률이라 이번 투표에서는 아무도 탈락하지 않았습니다.';
+
+  const result: ExecutionResult = {
+    round: game.round,
+    eliminated: eliminated ? {
+      playerId: eliminated.id, nickname: eliminated.nickname,
+      roleName: game.settings.roleRevealOnDeath && eliminated.roleId ? ROLES[eliminated.roleId].name : undefined,
+    } : undefined,
+    tied,
+    message,
+    breakdown,
+  };
+  game.lastExecutionResult = result;
+  addEvent(game, '투표 결과', message, eliminated ? 'vote' : 'info');
+  addSystemChat(game, `🗳️ ${message}`);
+  updateBrainsAfterVote(game, result);
+  queueWinnerIfNeeded(game);
 }
 
-function privateEvidenceMessage(game: GameState, bot: Player, brain: BotBrainState): string | null {
-  const difficulty = game.settings.botDifficulty || 'NORMAL';
-  const profile = botProfile(difficulty);
-  if (Math.random() > profile.evidenceShareChance) return null;
+function clampSuspicion(value: number) { return Math.max(-100, Math.min(100, value)); }
+function changeSuspicion(bot: Player, targetId: string, delta: number) {
+  bot.botBrain ||= initBrain();
+  const current = bot.botBrain.suspicion[targetId] || 0;
+  bot.botBrain.suspicion[targetId] = clampSuspicion(current + delta);
+}
 
-  if (bot.roleId === 'forensic') {
-    const clue = (bot.forensicClues || []).find((c) => c.round === game.round - 1);
-    if (clue) {
-      return pickOne([
-        `내가 확인한 정보로는 ${clue.victimNickname} 사건 현장이 ${clue.clue.match(/\b(?:[A-F]|PRISON)\b/)?.[0] || '특정 구역'} 쪽이야. 이건 동선 맞춰볼 필요 있어.`,
-        `지난 사건 관련해서 꽤 확실한 정보가 하나 있어. ${clue.victimNickname} 쪽 동선부터 다시 맞춰보자.`,
+function updateBrainsFromChat(game: GameState, msg: ChatMessage) {
+  if (msg.system) return;
+  const text = msg.message.replace(/\s+/g, ' ');
+  const accuse = /(수상|의심|살인마|거짓|이상해|이상하|찜찜|몰아)/.test(text);
+  const trust = /(믿어|믿음|시민 같|시민같|괜찮아|확실히 시민)/.test(text);
+  const roleWords: Array<[string, RoleId]> = [
+    ['경찰', 'police'], ['의사', 'doctor'], ['경호원', 'bodyguard'], ['탐정', 'detective'], ['초감각', 'psychic'], ['시장', 'mayor'],
+  ];
+
+  for (const bot of game.players.filter((p) => p.isBot && p.status === 'ALIVE')) {
+    bot.botBrain ||= initBrain();
+    if (msg.timestamp <= bot.botBrain.lastProcessedChatAt) continue;
+    const factor = game.settings.botDifficulty === 'HARD' ? 1.5 : game.settings.botDifficulty === 'EASY' ? 0.6 : 1;
+    for (const target of alive(game)) {
+      if (target.id === msg.playerId) continue;
+      if (text.includes(target.nickname)) {
+        if (accuse) changeSuspicion(bot, target.id, 4 * factor);
+        if (trust) changeSuspicion(bot, target.id, -3 * factor);
+      }
+    }
+    if (msg.playerId !== bot.id) {
+      for (const [word, roleId] of roleWords) {
+        const selfClaim = (text.includes(`내가 ${word}`) || text.includes(`나는 ${word}`) || text.includes(`난 ${word}`) || text.includes(`${word}이야`) || text.includes(`${word}입니다`));
+        if (!selfClaim) continue;
+        const existing = Object.entries(bot.botBrain.roleClaims).find(([pid, rid]) => rid === roleId && pid !== msg.playerId);
+        bot.botBrain.roleClaims[msg.playerId] = roleId;
+        if (existing) {
+          changeSuspicion(bot, msg.playerId, 8 * factor);
+          changeSuspicion(bot, existing[0], 8 * factor);
+        }
+      }
+    }
+    bot.botBrain.lastProcessedChatAt = msg.timestamp;
+  }
+}
+
+function updateBrainsAfterNight(game: GameState, deaths: Player[]) {
+  if (!deaths.length || !game.settings.roleRevealOnDeath) return;
+  for (const bot of game.players.filter((p) => p.isBot && p.status === 'ALIVE')) {
+    for (const dead of deaths) {
+      if (bot.botBrain?.roleClaims[dead.id]) {
+        const claim = bot.botBrain.roleClaims[dead.id];
+        if (dead.roleId && claim === dead.roleId) changeSuspicion(bot, dead.id, -5);
+      }
+    }
+  }
+}
+
+function updateBrainsAfterVote(game: GameState, result: ExecutionResult) {
+  if (!result.eliminated) return;
+  const eliminated = game.players.find((p) => p.id === result.eliminated?.playerId);
+  if (!eliminated || !game.settings.roleRevealOnDeath) return;
+  const eliminatedTeam = roleTeam(eliminated.roleId);
+  for (const bot of game.players.filter((p) => p.isBot && p.status === 'ALIVE' && roleTeam(p.roleId) === 'citizen')) {
+    for (const item of result.breakdown) {
+      const voter = game.players.find((p) => p.nickname === item.voterNickname);
+      if (!voter) continue;
+      if (item.targetNickname === eliminated.nickname) {
+        changeSuspicion(bot, voter.id, eliminatedTeam === 'killer' ? -4 : 3);
+      } else if (eliminatedTeam === 'killer') {
+        changeSuspicion(bot, voter.id, 1.5);
+      }
+    }
+  }
+}
+
+function clueSuspicionBonus(bot: Player, targetId: string): number {
+  let bonus = 0;
+  for (const clue of bot.privateClues) {
+    if (clue.targetPlayerId !== targetId) continue;
+    if (clue.resultCode === 'KILLER') bonus += 90;
+    if (clue.resultCode === 'CITIZEN') bonus -= 35;
+    if (clue.resultCode === 'ACTED') bonus += 8;
+    if (clue.resultCode === 'SPECIAL' && roleTeam(bot.roleId) === 'killer') bonus += 30;
+  }
+  return bonus;
+}
+
+function suspicionScore(bot: Player, target: Player): number {
+  const base = bot.botBrain?.suspicion[target.id] || 0;
+  return base + clueSuspicionBonus(bot, target.id) + Math.random() * 6;
+}
+
+function chooseCitizenBotTarget(game: GameState, bot: Player): Player | null {
+  const targets = aliveOthers(game, bot.id).filter((p) => roleTeam(p.roleId) !== (roleTeam(bot.roleId) === 'killer' ? 'killer' : null));
+  if (!targets.length) return null;
+  if (game.settings.botDifficulty === 'EASY' && Math.random() < 0.55) return pick(targets);
+  return [...targets].sort((a, b) => suspicionScore(bot, b) - suspicionScore(bot, a))[0];
+}
+
+function chooseKillerVictim(game: GameState, bot: Player): Player | null {
+  const targets = alive(game).filter((p) => roleTeam(p.roleId) === 'citizen');
+  if (!targets.length) return null;
+  const claims = bot.botBrain?.roleClaims || {};
+  const valuable: RoleId[] = ['police', 'doctor', 'detective', 'psychic', 'bodyguard'];
+  const ranked = targets.map((p) => {
+    const claimed = claims[p.id];
+    const claimBonus = claimed && valuable.includes(claimed) ? 35 : 0;
+    const socialTrust = -(bot.botBrain?.suspicion[p.id] || 0);
+    return { p, score: claimBonus + socialTrust + Math.random() * 20 };
+  }).sort((a, b) => b.score - a.score);
+  if (game.settings.botDifficulty === 'EASY') return pick(targets);
+  return ranked[0].p;
+}
+
+function botNightTarget(game: GameState, bot: Player, type: NightActionType): Player | null {
+  const targets = validTargets(game, bot, type);
+  if (!targets.length) return null;
+  if (type === 'KILL') return chooseKillerVictim(game, bot);
+  if (type === 'HEAL' || type === 'GUARD') {
+    // Citizen-side bots never inspect hidden teams here. They may only avoid a publicly revealed killer.
+    const publiclySafe = targets.filter((p) => !(p.revealedRole && roleTeam(p.roleId) === 'killer'));
+    const pool = publiclySafe.length ? publiclySafe : targets;
+    const claims = bot.botBrain?.roleClaims || {};
+    const protectedRoleClaims: RoleId[] = ['police', 'detective', 'psychic'];
+    const priority = pool.filter((p) => claims[p.id] && protectedRoleClaims.includes(claims[p.id]));
+    if (priority.length && game.settings.botDifficulty !== 'EASY') return pick(priority);
+    return pick(pool);
+  }
+  if (type === 'SPY_SCAN' || type === 'BLOCK') {
+    const claims = bot.botBrain?.roleClaims || {};
+    const priority = targets.filter((p) => claims[p.id] && claims[p.id] !== 'mayor');
+    if (priority.length && game.settings.botDifficulty !== 'EASY') return pick(priority);
+    return pick(targets);
+  }
+  return chooseCitizenBotTarget(game, bot) || pick(targets);
+}
+
+function runBotNightAction(game: StoredGame, bot: Player) {
+  const type = requiredNightAction(game, bot);
+  if (!type || game.nightActions[bot.id]) return;
+  const target = botNightTarget(game, bot, type);
+  if (!target) return;
+  game.nightActions[bot.id] = { actorId: bot.id, type, targetPlayerId: target.id, submittedAt: now(), auto: true };
+}
+
+function runBotVote(game: StoredGame, bot: Player, force = false) {
+  if (game.votes[bot.id] || bot.status !== 'ALIVE') return;
+  let target: Player | null = null;
+  if (roleTeam(bot.roleId) === 'killer') {
+    const citizens = aliveOthers(game, bot.id).filter((p) => roleTeam(p.roleId) === 'citizen');
+    if (!citizens.length) return;
+    if (game.settings.botDifficulty === 'EASY') target = pick(citizens);
+    else target = [...citizens].sort((a, b) => (bot.botBrain?.suspicion[b.id] || 0) - (bot.botBrain?.suspicion[a.id] || 0) + Math.random() * 4)[0];
+  } else {
+    target = chooseCitizenBotTarget(game, bot);
+  }
+  if (!target) return;
+  const weight = bot.roleId === 'mayor' && bot.mayorRevealed ? 2 : 1;
+  game.votes[bot.id] = { voterId: bot.id, targetPlayerId: target.id, weight, submittedAt: now(), auto: true };
+  if (!force && allVotesDone(game)) game.phaseExpiresAt = Math.min(game.phaseExpiresAt || Infinity, now() + 1200);
+}
+
+function maybeRevealBotMayor(game: StoredGame, bot: Player) {
+  if (bot.roleId !== 'mayor' || bot.mayorRevealed || game.phase !== 'DISCUSSION') return;
+  const selfPressure = bot.botBrain?.suspicion[bot.id] || 0;
+  const chance = game.settings.botDifficulty === 'HARD' ? 0.25 : 0.1;
+  if (game.round >= 3 && Math.random() < chance || selfPressure > 20) {
+    bot.mayorRevealed = true;
+    bot.revealedRole = true;
+    addSystemChat(game, `👑 ${bot.nickname}님이 시장임을 공개했습니다. 이제 투표권이 2표입니다.`);
+    addEvent(game, '시장 공개', `${bot.nickname}님이 시장임을 공개했습니다.`, 'ability');
+  }
+}
+
+function freshestUsefulClue(bot: Player): PrivateClue | null {
+  bot.botBrain ||= initBrain();
+  const shared = new Set((bot.botBrain as any).sharedClueIds || []);
+  const clues = [...bot.privateClues].reverse();
+  return clues.find((c) => !shared.has(c.id) && ['KILLER', 'CITIZEN', 'ACTED', 'VISITED', 'SPECIAL'].includes(c.resultCode || '')) || null;
+}
+
+function markClueShared(bot: Player, clue: PrivateClue) {
+  bot.botBrain ||= initBrain();
+  const brain: any = bot.botBrain;
+  brain.sharedClueIds ||= [];
+  brain.sharedClueIds.push(clue.id);
+}
+
+function botDiscussionMessage(game: StoredGame, bot: Player): string {
+  bot.botBrain ||= initBrain();
+  const profile = botProfile(game.settings.botDifficulty);
+  const others = aliveOthers(game, bot.id);
+  const target = roleTeam(bot.roleId) === 'killer' ? chooseKillerVictim(game, bot) : chooseCitizenBotTarget(game, bot);
+  const lastHuman = [...game.chatMessages].reverse().find((m) => !m.system && !m.isBot && m.round === game.round);
+  const botWasMentioned = lastHuman?.message.includes(bot.nickname);
+  const clue = freshestUsefulClue(bot);
+
+  if (clue && Math.random() < profile.logic) {
+    const t = game.players.find((p) => p.id === clue.targetPlayerId);
+    if (t) {
+      markClueShared(bot, clue);
+      if (clue.resultCode === 'KILLER') return pick([
+        `${t.nickname}님 쪽은 오늘 꼭 확인했으면 해. 꽤 강한 근거가 있어.`,
+        `나는 ${t.nickname}님을 가장 의심해. 그냥 감이 아니라 이유가 있어.`,
+        `${t.nickname}님은 오늘 투표 후보에서 빼면 안 될 것 같아.`,
+      ]);
+      if (clue.resultCode === 'CITIZEN') return pick([
+        `나는 일단 ${t.nickname}님은 오늘 우선순위에서 빼고 싶어.`,
+        `${t.nickname}님보다 다른 쪽을 보는 게 맞을 것 같아.`,
+      ]);
+      if (clue.resultCode === 'VISITED' || clue.resultCode === 'ACTED') return pick([
+        `${t.nickname}님, 어젯밤 행동에 대해서 설명해줄 수 있어?`,
+        `${t.nickname}님 쪽에서 밤 행동 흔적이 보여. 역할 공개까지는 말고 설명은 듣고 싶어.`,
+      ]);
+      if (clue.resultCode === 'SPECIAL' && roleTeam(bot.roleId) === 'killer') return pick([
+        `${t.nickname}님이 말을 좀 아끼는 느낌인데, 역할 있는 사람처럼 보여서 오히려 확인해보고 싶어.`,
+        `${t.nickname}님 의견이 궁금해. 지금 누구 의심해?`,
       ]);
     }
   }
 
-  if (bot.roleId === 'witness') {
-    const clue = (bot.witnessClues || []).find((c) => c.round === game.round - 1);
-    if (clue) {
-      const room = clue.clue.match(/\b(?:[A-F]|PRISON)\b/)?.[0];
-      return room
-        ? `지난 사건 때 ${room} 구역 쪽 움직임이 수상했다는 정보가 있어. 그 방 주장한 사람들 다시 말해봐.`
-        : `지난 사건 동선에서 수상한 움직임이 있었어. 방 주장들 다시 맞춰보자.`;
-    }
+  if (botWasMentioned && target) return pick([
+    `나도 확정은 못 해. 지금은 ${target.nickname}님 쪽이 더 걸려서 그쪽부터 보고 있어.`,
+    `내 생각은 ${target.nickname}님이 제일 의심스러워. 근거 더 나오면 바꿀 수도 있어.`,
+    `나한테 물어본 거면, 지금 1순위는 ${target.nickname}님이야.`,
+  ]);
+
+  const accuser = [...game.chatMessages].reverse().find((m) => !m.system && m.playerId !== bot.id && m.message.includes(bot.nickname) && /(의심|수상|살인마|이상)/.test(m.message));
+  if (accuser && target && Math.random() < 0.7) return pick([
+    `나를 의심하는 건 괜찮은데 근거부터 맞춰보자. 나는 ${target.nickname}님 쪽이 더 걸려.`,
+    `내 이름만 올리지 말고 이유를 같이 보자. 지금은 ${target.nickname}님 발언이 더 애매해 보여.`,
+  ]);
+
+  if (target) {
+    const score = bot.botBrain.suspicion[target.id] || 0;
+    if (score > 8 || Math.random() < 0.45) return pick([
+      `${target.nickname}님 말이 조금 걸려. 지금 누구를 제일 의심하는지 말해줄래?`,
+      `나는 현재 ${target.nickname}님을 조금 더 보고 있어. 다른 사람 생각은 어때?`,
+      `${target.nickname}님 쪽이 찜찜한데, 확정할 정도는 아니야. 근거 더 모아보자.`,
+      `지금 바로 몰기보단 ${target.nickname}님 발언을 한 번 더 들어보고 싶어.`,
+    ]);
   }
 
-  if (bot.roleId === 'psychic' && brain.lastRoom && brain.lastPsychicCount != null) {
-    return `지난 라운드 내가 있던 ${brain.lastRoom} 쪽 실제 인원은 ${brain.lastPsychicCount}명이었어. 방 주장 숫자랑 안 맞는 사람 있나 보자.`;
-  }
-
-  if (bot.roleId === 'police' && brain.lastPoliceAlert && difficulty !== 'EASY') {
-    return difficulty === 'HARD'
-      ? `지난 라운드 내 동선 쪽에서 공격 징후가 있었어. 내가 있던 방 관련 주장은 특히 꼼꼼히 볼게.`
-      : `내 쪽 동선에서 좀 이상한 일이 있었어. 지난 라운드 방 얘기 다시 맞춰보자.`;
-  }
-
-  return null;
+  const randomTarget = others.length ? pick(others) : null;
+  if (randomTarget) return pick([
+    `정보 있는 사람은 역할을 바로 까기보다 힌트만 줘도 될 것 같아.`,
+    `${randomTarget.nickname}님은 지금 누구 의심해? 이유도 같이 말해줘.`,
+    `지난 투표랑 오늘 말이 이어지는지 보자. 말 바뀌는 사람이 제일 위험해.`,
+    `아직 확정할 사람은 없어 보여. 서로 한 명씩 의심 후보를 말해보자.`,
+    `살인마 팀끼리 서로 너무 안 건드릴 수도 있으니까 감싸는 관계도 보자.`,
+  ]);
+  return '아직 정보가 부족해. 조금 더 얘기해보자.';
 }
 
-function generateBotMessage(game: GameState, bot: Player, brain: BotBrainState): { text: string; kind: string } {
-  const difficulty = game.settings.botDifficulty || 'NORMAL';
-  const profile = botProfile(difficulty);
-  const messageIndex = brain.messagesThisDiscussion || 0;
-
-  // Round 1 is pure social setup: no resolved room information exists yet.
-  if (game.round === 1 || !brain.lastRoomRound) {
-    if (difficulty === 'EASY') {
-      return {
-        text: pickOne([
-          '일단 첫 판은 정보 별로 없으니까 너무 빨리 몰아가진 말자.',
-          '난 일단 방 선택 끝나고 나오는 정보부터 볼게.',
-          '첫 라운드는 감 좀 봐야겠다 ㅋㅋ 다들 말 바뀌는지만 보자.',
-          '누가 너무 조용한지도 좀 봐야 할 듯.',
-        ]),
-        kind: 'intro',
-      };
-    }
-    if (difficulty === 'HARD') {
-      return {
-        text: pickOne([
-          '방 정보 말할 땐 라운드 번호 같이 말하자. 나중에 주장 바뀌는지 확인하기 편해.',
-          '첫 라운드는 억지 추리보다 발언 기록 남기는 게 낫다. 다음 대화 때 모순부터 보자.',
-          '사건 나면 사망자만 보지 말고 각자 방 주장부터 한 번에 맞춰보자.',
-          '처음부터 역할 공개는 하지 말고, 방 주장과 말 바뀌는지만 체크하는 게 안전해.',
-        ]),
-        kind: 'intro',
-      };
-    }
-    return {
-      text: pickOne([
-        '첫 라운드는 정보가 없으니까 다음 대화 때 방 주장부터 맞춰보자.',
-        '말 바뀌는 사람 있는지만 기억해두면 될 듯.',
-        '사건 나면 각자 지난 방 어디였는지 바로 말하자.',
-        '일단 너무 찍지 말고 방 정보 모아서 보자.',
-      ]),
-      kind: 'intro',
-    };
-  }
-
-  // Information roles sometimes contribute useful evidence without explicitly naming their role.
-  if (messageIndex === 0) {
-    const evidence = privateEvidenceMessage(game, bot, brain);
-    if (evidence) return { text: evidence, kind: 'evidence' };
-  }
-
-  const { player: suspect, score } = chooseSuspect(game, bot, brain);
-  const recent = (game.chatMessages || []).filter(
-    (m) => m.round === game.round && m.phase === 'PRE_SELECTION_DISCUSSION'
-  );
-  const suspectClaims = suspect
-    ? new Set(recent.filter((m) => m.playerId === suspect.id).flatMap((m) => extractRoomClaims(m.message)))
-    : new Set<RoomId>();
-
-  // First substantive statement is usually a room claim. Killer-side bots bluff more convincingly as difficulty rises.
-  if (messageIndex === 0 || (messageIndex === 1 && brain.lastMessageKind === 'evidence')) {
-    const claim = chooseClaimRoom(game, bot, brain);
-    if (claim) {
-      const claimText = claim === 'PRISON' ? '감옥' : `${claim}방`;
-      return {
-        text: pickOne([
-          `난 지난 라운드 ${claimText}이었어. 다른 사람들도 방부터 말해줘.`,
-          `내 동선부터 말하면 지난 라운드는 ${claimText}. 이제 서로 주장 맞춰보자.`,
-          `지난 판 나는 ${claimText} 갔어. 이건 일단 내 주장으로 기록해둬.`,
-        ]),
-        kind: 'claim',
-      };
-    }
-  }
-
-  if (suspect && suspectClaims.size >= 2 && difficulty !== 'EASY') {
-    return {
-      text: `${suspect.nickname}, 아까 방 얘기가 ${[...suspectClaims].join('방 / ')}방으로 두 개 나왔는데 어느 쪽이 맞아? 이건 좀 확인해야 할 것 같아.`,
-      kind: 'contradiction',
-    };
-  }
-
-  if (suspect && score >= (difficulty === 'HARD' ? 1.45 : difficulty === 'NORMAL' ? 1.15 : 1.55)) {
-    const wording = difficulty === 'HARD'
-      ? pickOne([
-          `${suspect.nickname} 쪽 발언이 지금 제일 걸려. 확정은 아닌데 지난 라운드 동선 다시 정확히 말해줘.`,
-          `현재는 ${suspect.nickname}을 제일 의심 중이야. 근거 더 나오기 전까진 체포까지는 이르지만 계속 볼게.`,
-          `${suspect.nickname} 말이 다른 주장들이랑 잘 안 맞는 느낌이야. 누가 같이 확인 가능한 정보 있어?`,
-        ])
-      : pickOne([
-          `난 지금 ${suspect.nickname}이 좀 수상해 보여. 지난 방 다시 말해줄래?`,
-          `${suspect.nickname} 쪽이 조금 걸리는데 다른 사람들은 어떻게 봐?`,
-          `일단 ${suspect.nickname} 발언은 한 번 더 확인해보자.`,
-        ]);
-    return { text: wording, kind: 'suspicion' };
-  }
-
-  if (suspect && Math.random() < profile.questionChance) {
-    return {
-      text: pickOne([
-        `${suspect.nickname}, 지난 라운드 어느 방이었어?`,
-        `${suspect.nickname} 방 주장 아직 안 했으면 지금 말해줘.`,
-        `${suspect.nickname}, 지난 판 동선 한 번만 정확히 정리해줘.`,
-      ]),
-      kind: 'question',
-    };
-  }
-
-  const latestHuman = [...recent].reverse().find((m) => !m.isBot && m.playerId !== bot.id);
-  if (latestHuman && difficulty !== 'EASY') {
-    const claims = extractRoomClaims(latestHuman.message);
-    if (claims.length) {
-      return {
-        text: `${latestHuman.nickname}은 ${claims.join('/')}방 주장으로 보면 되는 거지? 일단 기록해둘게.`,
-        kind: 'reaction',
-      };
-    }
-  }
-
-  return {
-    text: pickOne([
-      '아직 확정할 정도는 아닌 것 같아. 방 주장 더 모아보자.',
-      '지금은 말 바뀌는 사람 있는지 보는 게 제일 중요해 보여.',
-      '한 명 찍기보다 지난 라운드 동선부터 전부 맞춰보자.',
-      '정보 있는 사람 있으면 역할까지 까진 말고 결과만 공유해줘.',
-      '조용한 사람들도 지난 방은 하나씩 말해줘.',
-    ]),
-    kind: 'filler',
+function runBotDiscussion(game: StoredGame, bot: Player) {
+  if (game.phase !== 'DISCUSSION' || bot.status !== 'ALIVE') return;
+  const profile = botProfile(game.settings.botDifficulty);
+  bot.botBrain ||= initBrain();
+  if (bot.botBrain.discussionChatCount >= profile.maxChats) return;
+  maybeRevealBotMayor(game, bot);
+  const message = botDiscussionMessage(game, bot);
+  const chat: ChatMessage = {
+    id: id(), playerId: bot.id, nickname: bot.nickname, message, timestamp: now(), round: game.round, isBot: true,
   };
+  game.chatMessages.push(chat);
+  bot.botBrain.discussionChatCount += 1;
+  bot.botBrain.lastChatAt = now();
+  bot.botBrain.nextChatAt = now() + rand(profile.chatMin, profile.chatMax) * 1000;
+  updateBrainsFromChat(game, chat);
 }
 
-function pushBotChat(game: GameState, bot: Player, text: string, now: number) {
-  if (!game.chatMessages) game.chatMessages = [];
-  game.chatMessages.push({
-    id: generateId(),
-    playerId: bot.id,
-    nickname: bot.nickname,
-    message: text,
-    timestamp: now,
-    round: game.round,
-    phase: game.phase,
-    isBot: true,
-  });
-  if (game.chatMessages.length > 200) game.chatMessages = game.chatMessages.slice(-200);
-  game.updatedAt = now;
+function allNightActionsDone(game: GameState): boolean {
+  const required = alive(game).filter((p) => requiredNightAction(game, p));
+  return required.every((p) => !!game.nightActions[p.id]);
+}
+function allVotesDone(game: GameState): boolean {
+  return alive(game).every((p) => !!game.votes[p.id]);
 }
 
-function processBotDiscussion(game: GameState, now = Date.now()) {
-  if (game.status !== 'PLAYING' || game.phase !== 'PRE_SELECTION_DISCUSSION') return;
-  const difficulty = game.settings.botDifficulty || 'NORMAL';
-  const profile = botProfile(difficulty);
-  const bots = game.players.filter((p) => p.isBot && p.status === 'ALIVE');
-  if (!bots.length) return;
-
-  for (const bot of bots) {
-    const brain = ensureBotBrain(game, bot.id);
-    if (brain.discussionRound !== game.round) {
-      brain.discussionRound = game.round;
-      brain.messagesThisDiscussion = 0;
-      brain.nextChatAt = now + randInt(profile.initialDelayMin, profile.initialDelayMax) * 1000 + randInt(0, 1200);
-      brain.lastMessageKind = null;
-    }
-  }
-
-  const due = bots
-    .map((bot) => ({ bot, brain: ensureBotBrain(game, bot.id) }))
-    .filter(({ brain }) => brain.nextChatAt != null && now >= (brain.nextChatAt || 0))
-    .sort((a, b) => (a.brain.nextChatAt || 0) - (b.brain.nextChatAt || 0));
-
-  // One bot message per server tick prevents a wall of simultaneous bot text.
-  const next = due[0];
-  if (!next) return;
-
-  const targetCount = profile.minMessages + ((next.bot.id.charCodeAt(0) + game.round) % (profile.maxMessages - profile.minMessages + 1));
-  if ((next.brain.messagesThisDiscussion || 0) >= targetCount) {
-    next.brain.nextChatAt = null;
+function tickGame(game: StoredGame) {
+  const t = now();
+  if (game.status === 'LOBBY') {
+    if (game.players.length === MAX_PLAYERS && game.lobbyAutoStartAt && t >= game.lobbyAutoStartAt) startInternal(game);
     return;
   }
-
-  const generated = generateBotMessage(game, next.bot, next.brain);
-  pushBotChat(game, next.bot, generated.text, now);
-  next.brain.messagesThisDiscussion = (next.brain.messagesThisDiscussion || 0) + 1;
-  next.brain.lastMessageKind = generated.kind;
-
-  if ((next.brain.messagesThisDiscussion || 0) >= targetCount) {
-    next.brain.nextChatAt = null;
-  } else {
-    next.brain.nextChatAt = now + randInt(profile.gapMin, profile.gapMax) * 1000 + randInt(0, 1200);
-  }
-}
-
-function rememberBotRoundOutcome(game: GameState, victimNickname: string | null) {
-  for (const bot of game.players.filter((p) => p.isBot)) {
-    const brain = ensureBotBrain(game, bot.id);
-    brain.lastRoom = bot.currentRoom || null;
-    brain.lastRoomRound = game.round;
-    brain.lastPsychicCount = bot.extrasensoryRoomCount ?? null;
-    brain.lastPoliceAlert = !!bot.policeAttackedAlert;
-    brain.lastVictimNickname = victimNickname;
-    brain.lastMurderRound = victimNickname ? game.round : null;
-  }
-}
-
-function botShouldUsePrisonPass(game: GameState): boolean {
-  const d = game.settings.botDifficulty || 'NORMAL';
-  return Math.random() < (d === 'EASY' ? 0.45 : d === 'NORMAL' ? 0.72 : 0.9);
-}
-
-function processOneBotAbility(game: GameState, bot: Player, brain: BotBrainState, now: number) {
-  if (bot.status !== 'ALIVE') return;
-  const difficulty = game.settings.botDifficulty || 'NORMAL';
-
-  if (bot.currentRoom === 'PRISON' && (bot.inventory?.prisonPassCount || 0) > 0 && botShouldUsePrisonPass(game)) {
-    bot.inventory.prisonPassCount -= 1;
-    bot.usedPrisonPassThisRound = true;
-    bot.currentRoom = bot.selectedRoom || null;
-    bot.confirmedRoom = true;
-    bot.roomConfirmed = true;
-    addGameLog(game, `${bot.nickname}(BOT)이 탈옥권을 사용했습니다.`, 'warden');
-    game.updatedAt = now;
-    return;
-  }
-
-  if (!bot.roleId) return;
-
-  if (bot.roleId === 'gambler' && !bot.gamblerBet && bot.abilityUsesRemaining > 0) {
-    let bet: 'citizen' | 'killer';
-    if (difficulty === 'HARD') {
-      // Uses only public game pace, not hidden team composition.
-      bet = game.killerKillCount >= 2 ? 'killer' : Math.random() < 0.63 ? 'citizen' : 'killer';
-    } else if (difficulty === 'NORMAL') {
-      bet = Math.random() < 0.57 ? 'citizen' : 'killer';
-    } else {
-      bet = Math.random() < 0.5 ? 'citizen' : 'killer';
-    }
-    bot.gamblerBet = bet;
-    bot.abilityUsesRemaining = 0;
-    game.updatedAt = now;
-    return;
-  }
-
-  if (bot.roleId === 'warden' && bot.abilityUsesRemaining > 0 && !game.wardenTargetPlayerId) {
-    const { player: target, score } = chooseSuspect(game, bot, brain);
-    if (!target) return;
-    const useChance = difficulty === 'EASY' ? 0.48 : difficulty === 'NORMAL' ? 0.7 : score >= 1.2 ? 0.9 : 0.68;
-    if (Math.random() > useChance) return;
-    target.currentRoom = 'PRISON';
-    game.wardenTargetPlayerId = target.id;
-    bot.abilityUsesRemaining = Math.max(0, bot.abilityUsesRemaining - 1);
-    addGameLog(game, `[교도관 능력] ${target.nickname} 님이 이번 라운드 감옥으로 격리되었습니다.`, 'warden');
-    game.updatedAt = now;
-    return;
-  }
-
-  if (bot.roleId === 'police' && bot.abilityUsesRemaining > 0) {
-    const { player: target, score } = chooseSuspect(game, bot, brain);
-    if (!target) return;
-    const shouldArrest = difficulty === 'EASY'
-      ? game.round >= 2 && Math.random() < 0.22
-      : difficulty === 'NORMAL'
-      ? (game.round >= 3 && score >= 1.7 && Math.random() < 0.48) || (game.round >= 7 && Math.random() < 0.28)
-      : (score >= 2.45 && game.round >= 2 && Math.random() < 0.72) || (game.round >= 7 && score >= 1.45 && Math.random() < 0.46);
-    if (!shouldArrest) return;
-
-    bot.abilityUsesRemaining = 0;
-    const isRealKiller = target.roleId === 'killer'; // Used only after target is chosen, to resolve the public rule.
-    if (isRealKiller) {
-      target.status = 'REMOVED';
-      game.status = 'GAME_OVER';
-      game.winner = 'citizen';
-      game.winnerReason = `경찰(BOT)이 진짜 살인마(${target.nickname})를 체포하여 시민 진영이 승리했습니다!`;
-      addGameLog(game, `[BOT 경찰 체포 성공] ${target.nickname} 님이 진짜 살인마였습니다.`, 'arrest');
-      addGameLog(game, `[게임 종료] 시민 진영 승리! - ${game.winnerReason}`, 'win');
-      calculateEndGameWinners(game);
-    } else {
-      target.status = 'REMOVED';
-      bot.status = 'REMOVED';
-      addGameLog(game, `[BOT 경찰 오검거] ${target.nickname} 님과 경찰이 함께 게임에서 제외되었습니다.`, 'arrest');
-      evaluateWinCondition(game);
-    }
-    game.updatedAt = now;
-    return;
-  }
-
-  if (bot.roleId === 'corrupt_police' && bot.abilityUsesRemaining > 0) {
-    const target = difficulty === 'EASY'
-      ? pickOne(aliveTargets(game, bot))
-      : difficulty === 'HARD'
-      ? chooseInfluentialTarget(game, bot)
-      : chooseSuspect(game, bot, brain).player;
-    if (!target) return;
-    const useChance = difficulty === 'EASY' ? 0.18 : difficulty === 'NORMAL' ? (game.round >= 3 ? 0.34 : 0.08) : (game.round >= 3 ? 0.52 : 0.12);
-    if (Math.random() > useChance) return;
-    target.status = 'REMOVED';
-    bot.status = 'REMOVED';
-    bot.abilityUsesRemaining = 0;
-    addGameLog(game, `[부패경찰 동귀어진] ${bot.nickname}(BOT)이 ${target.nickname} 님과 함께 제외되었습니다.`, 'arrest');
-    game.updatedAt = now;
-    evaluateWinCondition(game);
-  }
-}
-
-function processBotAbilityActions(game: GameState, now = Date.now()) {
-  if (game.status !== 'PLAYING' || game.phase !== 'ABILITY_ACTION' || !game.settings.allowRoleAbilities) return;
-  const bots = game.players.filter((p) => p.isBot && p.status === 'ALIVE');
-  if (!bots.length) return;
-
-  for (const bot of bots) {
-    const brain = ensureBotBrain(game, bot.id);
-    if (brain.abilityRound !== game.round) {
-      brain.abilityRound = game.round;
-      brain.nextAbilityAt = now + randInt(2, 8) * 1000 + randInt(0, 900);
-    }
-  }
-
-  const due = bots
-    .map((bot) => ({ bot, brain: ensureBotBrain(game, bot.id) }))
-    .filter(({ brain }) => brain.nextAbilityAt != null && now >= (brain.nextAbilityAt || 0))
-    .sort((a, b) => (a.brain.nextAbilityAt || 0) - (b.brain.nextAbilityAt || 0));
-
-  const next = due[0];
-  if (!next) return;
-  next.brain.nextAbilityAt = null;
-  processOneBotAbility(game, next.bot, next.brain, now);
-}
-
-
-function generateTwoDistinctRooms(): [RoomId, RoomId] {
-  const pool = [...ALL_ROOMS];
-  const idx1 = Math.floor(Math.random() * pool.length);
-  const room1 = pool[idx1];
-  pool.splice(idx1, 1);
-  const idx2 = Math.floor(Math.random() * pool.length);
-  const room2 = pool[idx2];
-  return [room1, room2];
-}
-
-function initializeRoundRoomOptions(game: GameState) {
-  game.players.forEach((p) => {
-    if (p.status === 'ALIVE') {
-      p.randomRoomOptions = generateTwoDistinctRooms();
-      p.roomOptionsGenerated = true;
-      p.selectedRoom = null;
-      p.confirmedRoom = false;
-      p.roomConfirmed = false;
-      p.currentRoom = null;
-      p.drawnRoom = null;
-      p.isRoomRevealed = false;
-      p.usedRoomPassThisRound = false;
-      p.usedPrisonPassThisRound = false;
-      p.extrasensoryRoomCount = null;
-      p.policeAttackedAlert = false;
-
-      // If Bot, automatically select one of the two options and confirm
-      if (p.isBot) {
-        const chosen = p.randomRoomOptions[Math.floor(Math.random() * 2)];
-        p.selectedRoom = chosen;
-        p.currentRoom = chosen;
-        p.confirmedRoom = true;
-        p.roomConfirmed = true;
-        p.isRoomRevealed = true;
-      }
-    }
-  });
-}
-
-/**
- * Privacy Sanitizer:
- * 1. Regular players can ONLY see their OWN room candidates, selected room, and secret clues/role.
- * 2. Regular players MUST NOT see other players' actual room locations or candidates.
- * 3. Regular players CAN see whether other players have confirmed (for 9/12 progress count).
- * 4. Host and Game Over state can see full info.
- */
-function sanitizeGameState(game: GameState, requesterId?: string): GameState {
-  const isGameOver = game.status === 'GAME_OVER';
-  const requester = game.players.find((p) => p.id === requesterId);
-  const requesterIsWarden = requester?.roleId === 'warden';
-
-  const sanitizedPlayers: Player[] = game.players.map((p) => {
-    const isSelf = p.id === requesterId;
-
-    if (isGameOver) {
-      const roleDef = p.roleId ? ROLES_DATA[p.roleId] : undefined;
-      return {
-        ...p,
-        role: roleDef,
-        confirmedRoom: !!(p.confirmedRoom || p.roomConfirmed),
-        roomConfirmed: !!(p.confirmedRoom || p.roomConfirmed),
-      };
-    }
-
-    if (isSelf) {
-      const roleDef = p.roleId ? ROLES_DATA[p.roleId] : undefined;
-      return {
-        ...p,
-        role: roleDef,
-        confirmedRoom: !!(p.confirmedRoom || p.roomConfirmed),
-        roomConfirmed: !!(p.confirmedRoom || p.roomConfirmed),
-      };
-    }
-
-    // Other player view: Hide room location, secret role, and private clues!
-    const safePlayer: Player = {
-      id: p.id,
-      nickname: p.nickname,
-      isHost: p.isHost,
-      isBot: p.isBot,
-      status: p.status,
-      inventory: { roomPassCount: 0, prisonPassCount: 0 },
-      confirmedRoom: !!(p.confirmedRoom || p.roomConfirmed),
-      roomConfirmed: !!(p.confirmedRoom || p.roomConfirmed),
-      roomOptionsGenerated: p.roomOptionsGenerated || false,
-      randomRoomOptions: null, // DO NOT REVEAL
-      selectedRoom: null, // DO NOT REVEAL
-      currentRoom: null, // DO NOT REVEAL
-      drawnRoom: null,
-      abilityUsesRemaining: p.abilityUsesRemaining,
-      joinedAt: p.joinedAt,
-    };
-
-    return safePlayer;
-  });
-
-  const { botBrains: _botBrains, ...publicGame } = game as StoredGame;
-
-  return {
-    ...publicGame,
-    players: sanitizedPlayers,
-    // Never leak secret role mapping or pending private clues before game over.
-    roleMapping: isGameOver ? game.roleMapping : undefined,
-    pendingForensicEvents: undefined,
-    wardenTargetPlayerId: isGameOver || requesterIsWarden ? game.wardenTargetPlayerId : null,
-    finalVotingVotes: isGameOver ? game.finalVotingVotes : undefined,
-    chatMessages: game.chatMessages || [],
-  };
-}
-
-// Calculate Neutral & Team Winners
-function calculateEndGameWinners(game: GameState) {
-  const teamWinner = game.winner;
-
-  game.players.forEach((p) => {
-    const roleId = p.roleId;
-    const isAlive = p.status === 'ALIVE';
-
-    if (!roleId) return;
-
-    if (roleId === 'pickpocket') {
-      const stealCount = p.stealCount || 0;
-      if (stealCount >= 3 && isAlive) {
-        p.isPersonalWinner = true;
-        p.personalWinReason = `절도 3회 달성 (${stealCount}/3) 및 최종 생존 성공`;
-      } else {
-        p.isPersonalWinner = false;
-        p.personalWinReason = isAlive ? `절도 횟수 부족 (${stealCount}/3)` : '게임 도중 사망/제외됨';
-      }
-    } else if (roleId === 'psychopath') {
-      const killCount = game.killerKillCount || 0;
-      if (killCount >= 3 && isAlive) {
-        p.isPersonalWinner = true;
-        p.personalWinReason = `살인마 3회 살인 달성 (${killCount}/3) 및 최종 생존 성공`;
-      } else {
-        p.isPersonalWinner = false;
-        p.personalWinReason = isAlive ? `살인 횟수 미달 (${killCount}/3)` : '게임 도중 사망/제외됨';
-      }
-    } else if (roleId === 'gambler') {
-      const bet = p.gamblerBet;
-      if (bet && bet === teamWinner && isAlive) {
-        p.isPersonalWinner = true;
-        p.personalWinReason = `베팅 진영(${bet === 'citizen' ? '시민' : '살인마'}) 승리 적중 및 최종 생존 성공`;
-      } else {
-        p.isPersonalWinner = false;
-        p.personalWinReason = !isAlive
-          ? '게임 도중 사망/제외됨'
-          : `베팅 실패 (베팅: ${bet === 'citizen' ? '시민' : '살인마'}, 실제 승리: ${teamWinner === 'citizen' ? '시민' : '살인마'})`;
-      }
-    } else {
-      const roleDef = ROLES_DATA[roleId];
-      if (roleDef) {
-        p.isPersonalWinner = roleDef.team === teamWinner;
-        p.personalWinReason = p.isPersonalWinner
-          ? `${roleDef.teamName} 승리`
-          : `${roleDef.teamName} 패배`;
-      }
-    }
-  });
-}
-
-// Check auto win conditions
-function evaluateWinCondition(game: GameState) {
   if (game.status !== 'PLAYING') return;
 
-  const killerPlayer = game.players.find((p) => p.roleId === 'killer');
-
-  // Condition 1: 3 Kills Achieved by Killer
-  if (game.killerKillCount >= 3) {
-    game.status = 'GAME_OVER';
-    game.winner = 'killer';
-    game.winnerReason = `살인마가 총 3회 살인에 성공하여 살인마 진영이 승리했습니다! (누적 살인: ${game.killerKillCount}회)`;
-    addGameLog(game, `[게임 종료] 살인마 진영 승리! - ${game.winnerReason}`, 'win');
-    calculateEndGameWinners(game);
-    return;
+  if (game.phase === 'NIGHT') {
+    for (const bot of game.players.filter((p) => p.isBot && p.status === 'ALIVE')) {
+      if ((bot.botBrain?.nextActionAt || Infinity) <= t) runBotNightAction(game, bot);
+    }
+    if (allNightActionsDone(game) && game.phaseExpiresAt && game.phaseExpiresAt - t > 1500) game.phaseExpiresAt = t + 1500;
+  }
+  if (game.phase === 'DISCUSSION') {
+    for (const bot of game.players.filter((p) => p.isBot && p.status === 'ALIVE')) {
+      if ((bot.botBrain?.nextChatAt || Infinity) <= t) runBotDiscussion(game, bot);
+    }
+  }
+  if (game.phase === 'VOTE') {
+    for (const bot of game.players.filter((p) => p.isBot && p.status === 'ALIVE')) {
+      if ((bot.botBrain?.nextActionAt || Infinity) <= t) runBotVote(game, bot);
+    }
+    if (allVotesDone(game) && game.phaseExpiresAt && game.phaseExpiresAt - t > 1500) game.phaseExpiresAt = t + 1500;
   }
 
-  // Condition 2: Killer is Arrested / Removed
-  if (killerPlayer && (killerPlayer.status === 'REMOVED' || killerPlayer.status === 'DEAD')) {
-    game.status = 'GAME_OVER';
-    game.winner = 'citizen';
-    game.winnerReason = `살인마(${killerPlayer.nickname})가 체포/제외되어 시민 진영이 승리했습니다!`;
-    addGameLog(game, `[게임 종료] 시민 진영 승리! - ${game.winnerReason}`, 'win');
-    calculateEndGameWinners(game);
-    return;
-  }
+  if (!game.phaseExpiresAt || t < game.phaseExpiresAt) return;
 
-  // Condition 3: Max Rounds Finished without Killer caught
-  if (game.round >= game.maxRound && game.phase === 'RESULT_DISCUSSION') {
-    // Round 10 reached and resolved
-    // Final vote can be initiated or Killer wins
-    game.status = 'GAME_OVER';
-    game.winner = 'killer';
-    game.winnerReason = `최대 ${game.maxRound}라운드가 종료될 때까지 살인마가 체포되지 않고 생존하여 살인마 진영이 승리했습니다!`;
-    addGameLog(game, `[게임 종료] 살인마 진영 승리! - ${game.winnerReason}`, 'win');
-    calculateEndGameWinners(game);
-    return;
-  }
-
-  // Condition 4: All Citizens Dead / Removed
-  const aliveCitizens = game.players.filter(
-    (p) => p.status === 'ALIVE' && p.roleId && ROLES_DATA[p.roleId]?.team === 'citizen'
-  );
-  if (aliveCitizens.length === 0 && game.players.length >= 12) {
-    game.status = 'GAME_OVER';
-    game.winner = 'killer';
-    game.winnerReason = '모든 시민이 사망하거나 제외되어 살인마 진영이 승리했습니다!';
-    addGameLog(game, `[게임 종료] 살인마 진영 승리! - ${game.winnerReason}`, 'win');
-    calculateEndGameWinners(game);
-  }
-}
-
-function deliverForensicCluesForNewRound(game: GameState) {
-  const forensicPlayer = game.players.find((p) => p.roleId === 'forensic' && p.status === 'ALIVE');
-  if (!forensicPlayer || !game.pendingForensicEvents?.length) return;
-
-  const ready = game.pendingForensicEvents.filter((ev) => ev.round < game.round);
-  const waiting = game.pendingForensicEvents.filter((ev) => ev.round >= game.round);
-  if (!ready.length) return;
-
-  if (!forensicPlayer.forensicClues) forensicPlayer.forensicClues = [];
-  ready.forEach((ev) => {
-    forensicPlayer.forensicClues?.unshift({
-      round: ev.round,
-      victimNickname: ev.victimNickname,
-      clue: `[ROUND ${ev.round} 감식 결과] ${ev.victimNickname} 님의 사망 현장은 ${ev.room} 구역이며, 단둘이 고립된 상태에서 공격이 발생한 것으로 확인되었습니다.`,
-    });
-  });
-  game.pendingForensicEvents = waiting;
-}
-
-/**
- * Execute Movement Resolution & Job Actions:
- * 1. Process Prison (Warden)
- * 2. Assign Rooms (Draw / Pass)
- * 3. Extrasensory Headcount
- * 4. 1:1 Killer Murder
- * 5. 1:1 Pickpocket Steal
- * 6. Generate Forensic & Witness Clues
- */
-function executeResolveMovement(game: GameState) {
-  // 1. Ensure all alive players have room assigned
-  game.players.forEach((p) => {
-    if (p.status === 'ALIVE') {
-      if (p.currentRoom === 'PRISON') {
-        // Already in prison
-      } else if (!p.currentRoom) {
-        if (p.selectedRoom) {
-          p.currentRoom = p.selectedRoom;
-        } else if (p.drawnRoom) {
-          p.currentRoom = p.drawnRoom;
-        } else {
-          // Random fallback draw
-          const randomRoom = ALL_ROOMS[Math.floor(Math.random() * ALL_ROOMS.length)];
-          p.currentRoom = randomRoom;
-          p.drawnRoom = randomRoom;
-        }
-        p.confirmedRoom = true;
+  if (game.phase === 'ROLE_REVEAL') {
+    beginPhase(game, 'NIGHT', game.settings.nightSeconds);
+    addSystemChat(game, '🌙 밤이 되었습니다. 자신의 능력이 있다면 대상을 선택하세요.');
+  } else if (game.phase === 'NIGHT') {
+    resolveNight(game);
+    beginPhase(game, 'MORNING', game.settings.morningSeconds);
+  } else if (game.phase === 'MORNING') {
+    if (finishPendingWinner(game)) persistSoon();
+    else {
+      beginPhase(game, 'DISCUSSION', game.settings.discussionSeconds);
+      addSystemChat(game, '💬 낮 토론이 시작되었습니다. 정보를 모아 살인마를 찾아보세요.');
+    }
+  } else if (game.phase === 'DISCUSSION') {
+    beginPhase(game, 'VOTE', game.settings.voteSeconds);
+    addSystemChat(game, '🗳️ 투표 시간입니다. 가장 의심되는 사람 한 명을 선택하세요.');
+  } else if (game.phase === 'VOTE') {
+    resolveVote(game);
+    beginPhase(game, 'EXECUTION', game.settings.executionSeconds);
+  } else if (game.phase === 'EXECUTION') {
+    if (finishPendingWinner(game)) persistSoon();
+    else {
+      game.round += 1;
+      if (game.round > 20) {
+        game.status = 'GAME_OVER';
+        game.winner = 'citizen';
+        game.winnerReason = '20라운드까지 살인마가 승리하지 못해 시민 진영이 승리했습니다.';
+        game.phaseExpiresAt = null;
+        game.players.forEach((p) => p.revealedRole = true);
+      } else {
+        beginPhase(game, 'NIGHT', game.settings.nightSeconds);
+        addSystemChat(game, `🌙 ROUND ${game.round}. 다시 밤이 되었습니다.`);
       }
     }
-  });
+  }
+  game.updatedAt = now();
+  persistSoon();
+}
 
-  // Group alive players by location
-  const roomOccupancy: Record<string, Player[]> = {
-    A: [],
-    B: [],
-    C: [],
-    D: [],
-    E: [],
-    F: [],
-    PRISON: [],
+setInterval(() => {
+  for (const game of Object.values(games)) tickGame(game);
+}, 500);
+
+function publicPlayer(game: StoredGame, player: Player, viewerId?: string): Player {
+  const copy: Player = JSON.parse(JSON.stringify(player));
+  delete copy.botBrain;
+  const viewer = viewerId ? game.players.find((p) => p.id === viewerId) : undefined;
+  const sameKillerTeam = viewer && roleTeam(viewer.roleId) === 'killer' && roleTeam(player.roleId) === 'killer';
+  const canSeeRole = player.id === viewerId || game.status === 'GAME_OVER' || !!player.revealedRole || !!sameKillerTeam;
+  if (canSeeRole && player.roleId) copy.role = ROLES[player.roleId];
+  else {
+    delete copy.roleId;
+    delete copy.role;
+  }
+  if (player.id !== viewerId) copy.privateClues = [];
+  return copy;
+}
+
+function sanitize(game: StoredGame, viewerId?: string): GameState {
+  const clone: GameState = JSON.parse(JSON.stringify(game));
+  clone.players = game.players.map((p) => publicPlayer(game, p, viewerId));
+  const ownNight = viewerId ? game.nightActions[viewerId] : undefined;
+  const ownVote = viewerId ? game.votes[viewerId] : undefined;
+  clone.nightActions = ownNight && viewerId ? { [viewerId]: ownNight } : {};
+  clone.votes = ownVote && viewerId ? { [viewerId]: ownVote } : {};
+  clone.myNightAction = ownNight || null;
+  clone.myVote = ownVote || null;
+  const viewer = viewerId ? game.players.find((p) => p.id === viewerId) : undefined;
+  clone.requiredNightAction = viewer ? requiredNightAction(game, viewer) : null;
+  delete (clone as any).pendingWinner;
+  delete (clone as any).pendingWinnerReason;
+  delete (clone as any).pausedRemainingMs;
+  delete (clone as any).version;
+  return clone;
+}
+
+function requireGame(req: any, res: any): StoredGame | null {
+  const code = String(req.params.gameId || '').toUpperCase();
+  const game = games[code];
+  if (!game) { res.status(404).json({ error: '게임방을 찾을 수 없습니다.' }); return null; }
+  tickGame(game);
+  return game;
+}
+
+function requirePlayer(game: StoredGame, playerId: unknown, res: any): Player | null {
+  const p = game.players.find((x) => x.id === playerId);
+  if (!p) { res.status(403).json({ error: '참가자 정보를 확인할 수 없습니다.' }); return null; }
+  return p;
+}
+
+function requireHost(game: StoredGame, playerId: unknown, res: any): Player | null {
+  const p = requirePlayer(game, playerId, res);
+  if (!p) return null;
+  if (!p.isHost) { res.status(403).json({ error: '방장만 사용할 수 있습니다.' }); return null; }
+  return p;
+}
+
+app.post('/api/games/create', (req, res) => {
+  const nickname = normalizeNickname(req.body.nickname);
+  if (!nickname) return res.status(400).json({ error: '닉네임을 입력해주세요.' });
+  const code = gameCode();
+  const host = createPlayer(nickname, true, false);
+  const game: StoredGame = {
+    version: GAME_VERSION,
+    gameId: code, hostId: host.id, status: 'LOBBY', round: 0, phase: 'ROLE_REVEAL', phaseExpiresAt: null,
+    lobbyAutoStartAt: null, winner: null, winnerReason: null, players: [host], chatMessages: [], events: [],
+    settings: { ...DEFAULT_SETTINGS }, createdAt: now(), updatedAt: now(), nightActions: {}, votes: {},
+    lastNightResult: null, lastExecutionResult: null, pendingWinner: null, pendingWinnerReason: null,
   };
+  games[code] = game;
+  persistSoon();
+  res.json({ gameId: code, playerId: host.id, game: sanitize(game, host.id) });
+});
 
-  game.players.forEach((p) => {
-    if (p.status === 'ALIVE' && p.currentRoom) {
-      if (!roomOccupancy[p.currentRoom]) roomOccupancy[p.currentRoom] = [];
-      roomOccupancy[p.currentRoom].push(p);
-    }
-  });
+app.post('/api/games/join', (req, res) => {
+  const code = String(req.body.gameId || '').trim().toUpperCase();
+  const game = games[code];
+  if (!game) return res.status(404).json({ error: '게임방을 찾을 수 없습니다.' });
+  tickGame(game);
+  const nickname = normalizeNickname(req.body.nickname);
+  if (!nickname) return res.status(400).json({ error: '닉네임을 입력해주세요.' });
 
-  // 2. Extrasensory (초감각자) Headcount Calculation
-  const psychicPlayer = game.players.find((p) => p.roleId === 'psychic' && p.status === 'ALIVE');
-  if (psychicPlayer && psychicPlayer.currentRoom) {
-    const actualHeadcount = roomOccupancy[psychicPlayer.currentRoom]?.length || 0;
-    psychicPlayer.extrasensoryRoomCount = actualHeadcount;
-  }
+  const requestedId = String(req.body.playerId || '');
+  const returning = requestedId ? game.players.find((p) => p.id === requestedId && !p.isBot) : undefined;
+  if (returning) return res.json({ gameId: code, playerId: returning.id, game: sanitize(game, returning.id) });
+  if (game.status !== 'LOBBY') return res.status(409).json({ error: '이미 게임이 시작되었습니다. 기존 참가자는 같은 기기에서 다시 접속해주세요.' });
+  if (game.players.some((p) => p.nickname === nickname && !p.isBot)) return res.status(409).json({ error: '이미 사용 중인 닉네임입니다.' });
 
-  // 3. Killer (살인마) 1:1 Murder Check
-  const killerPlayer = game.players.find((p) => p.roleId === 'killer' && p.status === 'ALIVE');
-  let murderOccurred = false;
-  let murderedVictim: Player | null = null;
-  let murderRoom: RoomLocation | null = null;
-
-  if (killerPlayer && killerPlayer.currentRoom) {
-    const killerRoom = killerPlayer.currentRoom;
-    const occupants = roomOccupancy[killerRoom] || [];
-
-    // Condition: Exactly 2 people in the room (1:1 isolation)
-    if (occupants.length === 2) {
-      const victim = occupants.find((p) => p.id !== killerPlayer.id);
-
-      if (victim) {
-        const victimRole = victim.roleId;
-
-        // In normal rooms (A~F): Follower, Corrupt Police, Police have protections!
-        if (killerRoom !== 'PRISON') {
-          if (victimRole === 'follower') {
-            // Follower protected in normal room
-          } else if (victimRole === 'corrupt_police') {
-            // Corrupt police protected
-          } else if (victimRole === 'police') {
-            // Police protected in normal room & receives secret alert!
-            victim.policeAttackedAlert = true;
-          } else {
-            // Murder succeeds!
-            victim.status = 'DEAD';
-            game.killerKillCount += 1;
-            murderOccurred = true;
-            murderedVictim = victim;
-            murderRoom = killerRoom;
-
-            addGameLog(
-              game,
-              `[사망 사건 발생] ${victim.nickname} 님이 살인마에게 살해되었습니다! (누적 살인: ${game.killerKillCount}/3)`,
-              'death'
-            );
-          }
-        } else {
-          // In PRISON: NO PROTECTIONS! (Follower, Police, Corrupt Police can all be killed)
-          victim.status = 'DEAD';
-          game.killerKillCount += 1;
-          murderOccurred = true;
-          murderedVictim = victim;
-          murderRoom = 'PRISON';
-
-          addGameLog(
-            game,
-            `[감옥 사망 사건] 감옥에서 ${victim.nickname} 님이 살인마에게 살해되었습니다! (누적 살인: ${game.killerKillCount}/3)`,
-            'death'
-          );
-        }
-      }
-    }
-  }
-
-  // 4. Pickpocket (소매치기) 1:1 Steal Check
-  const pickpocketPlayer = game.players.find((p) => p.roleId === 'pickpocket' && p.status === 'ALIVE');
-  if (pickpocketPlayer && pickpocketPlayer.currentRoom && pickpocketPlayer.currentRoom !== 'PRISON') {
-    const pickpocketRoom = pickpocketPlayer.currentRoom;
-    const occupants = roomOccupancy[pickpocketRoom] || [];
-
-    // Condition: Exactly 2 people in normal room
-    if (occupants.length === 2) {
-      pickpocketPlayer.stealCount = (pickpocketPlayer.stealCount || 0) + 1;
-      addGameLog(
-        game,
-        `[절도 성공] 소매치기가 1:1 밀실에서 절도에 성공했습니다. (누적: ${pickpocketPlayer.stealCount}/3)`,
-        'steal'
-      );
-    }
-  }
-
-  // 5. Witness (목격자) & Forensic (법의학자) Clues
-  if (murderOccurred && murderedVictim && murderRoom) {
-    // Witness Clue (Immediate)
-    const witnessPlayer = game.players.find((p) => p.roleId === 'witness' && p.status === 'ALIVE');
-    if (witnessPlayer) {
-      if (!witnessPlayer.witnessClues) witnessPlayer.witnessClues = [];
-      const clueMessage = `사건 발생 당시 ${murderRoom} 구역 부근에서 은밀하게 이동하는 그림자와 살기를 감지했습니다.`;
-      witnessPlayer.witnessClues.unshift({
-        round: game.round,
-        victimNickname: murderedVictim.nickname,
-        clue: clueMessage,
-      });
-    }
-
-    // Schedule Forensic Clue for next round
-    if (!game.pendingForensicEvents) game.pendingForensicEvents = [];
-    game.pendingForensicEvents.push({
-      round: game.round,
-      victimNickname: murderedVictim.nickname,
-      room: murderRoom,
-    });
-  }
-
-  // Store only each bot's own round information before the next round reset.
-  rememberBotRoundOutcome(game, murderedVictim?.nickname || null);
-
-  game.phase = 'DAY';
-  game.phaseExpiresAt = Date.now() + (game.settings.dayResultTimeSeconds || 8) * 1000;
-  game.updatedAt = Date.now();
-
-  const aliveCount = game.players.filter((p) => p.status === 'ALIVE').length;
-  addGameLog(
-    game,
-    `ROUND ${String(game.round).padStart(2, '0')} ☀️ 낮이 되었습니다! 모든 플레이어의 이동이 완료되었습니다. (생존: ${aliveCount}명)`,
-    'phase'
-  );
-
-  evaluateWinCondition(game);
-}
-
-function startGameInternal(game: GameState, now = Date.now()) {
-  if (game.status !== 'LOBBY' || game.players.length < 12) return false;
-
-  // Assign roles
-  if (game.mode === 'FIXED') {
-    game.players.forEach((player, index) => {
-      const customRole = game.roleMapping?.[player.id];
-      const presetRole = FIXED_ROLES_PRESET[index]?.roleId || ROLE_IDS_POOL[index % ROLE_IDS_POOL.length];
-      player.roleId = customRole || presetRole;
-      const roleDef = ROLES_DATA[player.roleId];
-      player.abilityUsesRemaining = roleDef?.abilityMaxUses || 0;
-      player.status = 'ALIVE';
-      player.inventory = { roomPassCount: 1, prisonPassCount: 1 };
-      player.selectedRoom = null;
-      player.confirmedRoom = false;
-      player.roomConfirmed = false;
-      player.currentRoom = null;
-      player.drawnRoom = null;
-      player.stealCount = 0;
-      player.forensicClues = [];
-      player.witnessClues = [];
-      player.policeAttackedAlert = false;
-    });
+  let newPlayer: Player;
+  if (game.players.length >= MAX_PLAYERS) {
+    const botIndex = game.players.map((p, i) => ({ p, i })).reverse().find(({ p }) => p.isBot)?.i;
+    if (botIndex === undefined) return res.status(409).json({ error: '게임방이 가득 찼습니다.' });
+    newPlayer = createPlayer(nickname, false, false);
+    game.players.splice(botIndex, 1, newPlayer);
   } else {
-    const shuffledRoles = shuffleArray(ROLE_IDS_POOL);
-    game.players.forEach((player, index) => {
-      player.roleId = shuffledRoles[index];
-      const roleDef = ROLES_DATA[player.roleId];
-      player.abilityUsesRemaining = roleDef?.abilityMaxUses || 0;
-      player.status = 'ALIVE';
-      player.inventory = { roomPassCount: 1, prisonPassCount: 1 };
-      player.selectedRoom = null;
-      player.confirmedRoom = false;
-      player.roomConfirmed = false;
-      player.currentRoom = null;
-      player.drawnRoom = null;
-      player.stealCount = 0;
-      player.forensicClues = [];
-      player.witnessClues = [];
-      player.policeAttackedAlert = false;
-    });
+    newPlayer = createPlayer(nickname, false, false);
+    game.players.push(newPlayer);
   }
+  game.updatedAt = now();
+  if (game.players.length === MAX_PLAYERS) game.lobbyAutoStartAt = now() + game.settings.autoStartDelaySeconds * 1000;
+  persistSoon();
+  res.json({ gameId: code, playerId: newPlayer.id, game: sanitize(game, newPlayer.id) });
+});
 
-  game.status = 'PLAYING';
-  game.round = 1;
-  game.phase = 'PRE_SELECTION_DISCUSSION';
-  game.phaseExpiresAt = now + game.settings.preDiscussionTimeSeconds * 1000;
+app.get('/api/games/:gameId', (req, res) => {
+  const game = requireGame(req, res); if (!game) return;
+  const viewerId = typeof req.query.playerId === 'string' ? req.query.playerId : undefined;
+  res.json({ game: sanitize(game, viewerId) });
+});
+
+app.post('/api/games/:gameId/leave', (req, res) => {
+  const game = requireGame(req, res); if (!game) return;
+  if (game.status !== 'LOBBY') return res.status(409).json({ error: '게임 시작 후에는 나갈 수 없습니다. 같은 링크로 다시 접속하면 복귀할 수 있습니다.' });
+  const p = requirePlayer(game, req.body.playerId, res); if (!p) return;
+  game.players = game.players.filter((x) => x.id !== p.id);
+  game.lobbyAutoStartAt = null;
+  if (p.isHost && game.players.length) {
+    const next = game.players.find((x) => !x.isBot) || game.players[0];
+    game.players.forEach((x) => x.isHost = x.id === next.id);
+    game.hostId = next.id;
+  }
+  if (!game.players.length) delete games[game.gameId];
+  persistSoon();
+  res.json({ ok: true });
+});
+
+app.post('/api/games/:gameId/host/fill-bots', (req, res) => {
+  const game = requireGame(req, res); if (!game) return;
+  const host = requireHost(game, req.body.playerId, res); if (!host) return;
+  if (game.status !== 'LOBBY') return res.status(409).json({ error: '로비에서만 BOT을 추가할 수 있습니다.' });
+  const used = new Set(game.players.map((p) => p.nickname));
+  while (game.players.length < MAX_PLAYERS) {
+    const names = BOT_NAMES.filter((n) => !used.has(n));
+    const base = names.length ? pick(names) : `BOT${game.players.length + 1}`;
+    used.add(base);
+    game.players.push(createPlayer(base, false, true));
+  }
+  game.lobbyAutoStartAt = now() + game.settings.autoStartDelaySeconds * 1000;
+  game.updatedAt = now();
+  persistSoon();
+  res.json({ game: sanitize(game, host.id) });
+});
+
+app.post('/api/games/:gameId/host/settings', (req, res) => {
+  const game = requireGame(req, res); if (!game) return;
+  const host = requireHost(game, req.body.playerId, res); if (!host) return;
+  if (game.status !== 'LOBBY') return res.status(409).json({ error: '게임 시작 전 로비에서만 설정할 수 있습니다.' });
+  const input = req.body.settings || {};
+  const allowedDifficulty: BotDifficulty[] = ['EASY', 'NORMAL', 'HARD'];
+  if (allowedDifficulty.includes(input.botDifficulty)) game.settings.botDifficulty = input.botDifficulty;
+  if (typeof input.roleRevealOnDeath === 'boolean') game.settings.roleRevealOnDeath = input.roleRevealOnDeath;
+  persistSoon();
+  res.json({ game: sanitize(game, host.id) });
+});
+
+app.post('/api/games/:gameId/start', (req, res) => {
+  const game = requireGame(req, res); if (!game) return;
+  const host = requireHost(game, req.body.playerId, res); if (!host) return;
+  if (game.players.length !== MAX_PLAYERS) return res.status(400).json({ error: '12명이 모두 참가해야 시작할 수 있습니다. 빈자리는 BOT으로 채울 수 있습니다.' });
+  startInternal(game);
+  res.json({ game: sanitize(game, host.id) });
+});
+
+app.post('/api/games/:gameId/chat', (req, res) => {
+  const game = requireGame(req, res); if (!game) return;
+  const p = requirePlayer(game, req.body.playerId, res); if (!p) return;
+  if (game.status !== 'PLAYING' || game.phase !== 'DISCUSSION') return res.status(409).json({ error: '낮 대화 시간에만 채팅할 수 있습니다.' });
+  if (p.status !== 'ALIVE') return res.status(409).json({ error: '탈락한 플레이어는 채팅을 읽을 수만 있습니다.' });
+  const message = String(req.body.message || '').trim().slice(0, 180);
+  if (!message) return res.status(400).json({ error: '메시지를 입력해주세요.' });
+  const chat: ChatMessage = { id: id(), playerId: p.id, nickname: p.nickname, message, timestamp: now(), round: game.round, isBot: !!p.isBot };
+  game.chatMessages.push(chat);
+  if (game.chatMessages.length > 240) game.chatMessages.splice(0, game.chatMessages.length - 240);
+  updateBrainsFromChat(game, chat);
+  const profile = botProfile(game.settings.botDifficulty);
+  const responsiveBots = shuffle(game.players.filter((x) => x.isBot && x.status === 'ALIVE')).slice(0, game.settings.botDifficulty === 'HARD' ? 2 : 1);
+  for (const bot of responsiveBots) {
+    bot.botBrain ||= initBrain();
+    bot.botBrain.nextChatAt = Math.min(bot.botBrain.nextChatAt || Infinity, now() + rand(2, Math.max(3, Math.floor(profile.chatMin / 2))) * 1000);
+  }
+  persistSoon();
+  res.json({ game: sanitize(game, p.id) });
+});
+
+app.post('/api/games/:gameId/night-action', (req, res) => {
+  const game = requireGame(req, res); if (!game) return;
+  const p = requirePlayer(game, req.body.playerId, res); if (!p) return;
+  if (game.status !== 'PLAYING' || game.phase !== 'NIGHT') return res.status(409).json({ error: '지금은 밤 능력을 사용할 시간이 아닙니다.' });
+  if (p.status !== 'ALIVE') return res.status(409).json({ error: '탈락한 플레이어는 행동할 수 없습니다.' });
+  const required = requiredNightAction(game, p);
+  const type = req.body.type as NightActionType;
+  if (!required || required !== type) return res.status(400).json({ error: '현재 역할에서 사용할 수 없는 능력입니다.' });
+  const target = validTargets(game, p, type).find((x) => x.id === req.body.targetPlayerId);
+  if (!target) return res.status(400).json({ error: '선택할 수 없는 대상입니다.' });
+  game.nightActions[p.id] = { actorId: p.id, type, targetPlayerId: target.id, submittedAt: now() };
+  if (allNightActionsDone(game)) game.phaseExpiresAt = Math.min(game.phaseExpiresAt || Infinity, now() + 1200);
+  persistSoon();
+  res.json({ game: sanitize(game, p.id) });
+});
+
+app.post('/api/games/:gameId/mayor-reveal', (req, res) => {
+  const game = requireGame(req, res); if (!game) return;
+  const p = requirePlayer(game, req.body.playerId, res); if (!p) return;
+  if (game.status !== 'PLAYING' || game.phase !== 'DISCUSSION') return res.status(409).json({ error: '낮 대화 시간에만 시장을 공개할 수 있습니다.' });
+  if (p.status !== 'ALIVE' || p.roleId !== 'mayor') return res.status(400).json({ error: '시장만 사용할 수 있는 능력입니다.' });
+  if (p.mayorRevealed) return res.status(409).json({ error: '이미 시장임을 공개했습니다.' });
+  p.mayorRevealed = true;
+  p.revealedRole = true;
+  addSystemChat(game, `👑 ${p.nickname}님이 시장임을 공개했습니다. 이후 투표권은 2표입니다.`);
+  addEvent(game, '시장 공개', `${p.nickname}님이 시장임을 공개했습니다.`, 'ability');
+  persistSoon();
+  res.json({ game: sanitize(game, p.id) });
+});
+
+app.post('/api/games/:gameId/vote', (req, res) => {
+  const game = requireGame(req, res); if (!game) return;
+  const p = requirePlayer(game, req.body.playerId, res); if (!p) return;
+  if (game.status !== 'PLAYING' || game.phase !== 'VOTE') return res.status(409).json({ error: '지금은 투표 시간이 아닙니다.' });
+  if (p.status !== 'ALIVE') return res.status(409).json({ error: '탈락한 플레이어는 투표할 수 없습니다.' });
+  const target = aliveOthers(game, p.id).find((x) => x.id === req.body.targetPlayerId);
+  if (!target) return res.status(400).json({ error: '투표할 대상을 선택해주세요.' });
+  const weight = p.roleId === 'mayor' && p.mayorRevealed ? 2 : 1;
+  game.votes[p.id] = { voterId: p.id, targetPlayerId: target.id, weight, submittedAt: now() };
+  if (allVotesDone(game)) game.phaseExpiresAt = Math.min(game.phaseExpiresAt || Infinity, now() + 1200);
+  persistSoon();
+  res.json({ game: sanitize(game, p.id) });
+});
+
+app.post('/api/games/:gameId/host/toggle-pause', (req, res) => {
+  const game = requireGame(req, res); if (!game) return;
+  const host = requireHost(game, req.body.playerId, res); if (!host) return;
+  if (game.status === 'PLAYING') {
+    game.pausedRemainingMs = Math.max(0, (game.phaseExpiresAt || now()) - now());
+    game.status = 'PAUSED';
+    game.phaseExpiresAt = null;
+  } else if (game.status === 'PAUSED') {
+    game.status = 'PLAYING';
+    game.phaseExpiresAt = now() + Math.max(1000, game.pausedRemainingMs || 1000);
+    game.pausedRemainingMs = null;
+  } else return res.status(409).json({ error: '진행 중인 게임에서만 일시정지할 수 있습니다.' });
+  persistSoon();
+  res.json({ game: sanitize(game, host.id) });
+});
+
+app.post('/api/games/:gameId/host/return-lobby', (req, res) => {
+  const game = requireGame(req, res); if (!game) return;
+  const host = requireHost(game, req.body.playerId, res); if (!host) return;
+  game.status = 'LOBBY';
+  game.round = 0;
+  game.phase = 'ROLE_REVEAL';
+  game.phaseExpiresAt = null;
   game.lobbyAutoStartAt = null;
   game.winner = null;
   game.winnerReason = null;
-  game.killerKillCount = 0;
-  game.wardenTargetPlayerId = null;
-
-  initializeRoundRoomOptions(game);
-  game.updatedAt = now;
-  addGameLog(
-    game,
-    `[게임 시작] 12인의 비밀 역할이 배정되었습니다. ROUND 01 대화 시간이 시작되었습니다!`,
-    'phase'
-  );
-  return true;
-}
-
-function processLobbyAutoStart(game: GameState) {
-  if (game.status !== 'LOBBY') return;
-  const now = Date.now();
-
-  if (game.players.length < 12) {
-    if (game.lobbyAutoStartAt) {
-      game.lobbyAutoStartAt = null;
-      game.updatedAt = now;
-    }
-    return;
-  }
-
-  if (!game.lobbyAutoStartAt) {
-    game.lobbyAutoStartAt = now + 10_000;
-    game.updatedAt = now;
-    addGameLog(game, `[자동 시작] 12명이 모두 모였습니다. 10초 후 게임을 자동 시작합니다.`, 'phase');
-    return;
-  }
-
-  if (now >= game.lobbyAutoStartAt) {
-    startGameInternal(game, now);
-  }
-}
-
-// ===== Automatic round phase machine =====
-// Desired flow:
-// 대화 -> 방 선택 -> 특수능력 -> 낮 결과 -> 다음 라운드 -> 대화 ...
-function allAliveRoomsConfirmed(game: GameState): boolean {
-  const alivePlayers = game.players.filter((p) => p.status === 'ALIVE');
-  return (
-    alivePlayers.length > 0 &&
-    alivePlayers.every(
-      (p) =>
-        (p.confirmedRoom || p.roomConfirmed) &&
-        (!!p.selectedRoom || p.currentRoom === 'PRISON')
-    )
-  );
-}
-
-function autoConfirmMissingRooms(game: GameState) {
-  game.players.forEach((p) => {
-    if (p.status !== 'ALIVE' || p.confirmedRoom || p.roomConfirmed) return;
-
-    // A timeout must never invent a room outside the player's two candidates.
-    if (!p.randomRoomOptions || p.randomRoomOptions.length < 2) {
-      p.randomRoomOptions = generateTwoDistinctRooms();
-      p.roomOptionsGenerated = true;
-    }
-
-    const chosen = p.selectedRoom || p.randomRoomOptions[Math.floor(Math.random() * 2)];
-    p.selectedRoom = chosen;
-    p.currentRoom = chosen;
-    p.confirmedRoom = true;
-    p.roomConfirmed = true;
-    p.isRoomRevealed = true;
-  });
-}
-
-function beginRoomSelection(game: GameState, now = Date.now()) {
-  game.phase = 'ROOM_SELECTION';
-  game.phaseExpiresAt = now + (game.settings.roomSelectionTimeSeconds || 15) * 1000;
-  game.updatedAt = now;
-  addGameLog(game, `[방 선택 시작] 랜덤 후보 2개 중 이동할 방 1개를 선택하세요.`, 'phase');
-
-  // Bots may already have confirmed at round initialization.
-  if (allAliveRoomsConfirmed(game)) beginAbilityAction(game, now);
-}
-
-function beginAbilityAction(game: GameState, now = Date.now()) {
-  if (game.status !== 'PLAYING') return;
-  game.phase = 'ABILITY_ACTION';
-  game.phaseExpiresAt = now + (game.settings.abilityActionTimeSeconds || 15) * 1000;
-  game.updatedAt = now;
-  addGameLog(
-    game,
-    `[특수능력 단계] 방 선택이 끝났습니다. 사용형 직업은 지금 능력을 선택/실행하세요.`,
-    'phase'
-  );
-}
-
-function advanceToNextRound(game: GameState, now = Date.now()) {
-  if (game.status !== 'PLAYING') return;
-
-  if (game.round >= game.maxRound) {
-    game.phase = 'RESULT_DISCUSSION';
-    game.phaseExpiresAt = null;
-    game.updatedAt = now;
-    evaluateWinCondition(game);
-    return;
-  }
-
-  game.round += 1;
-  deliverForensicCluesForNewRound(game);
-  game.phase = 'PRE_SELECTION_DISCUSSION';
-  game.phaseExpiresAt = now + (game.settings.preDiscussionTimeSeconds || 60) * 1000;
-  game.wardenTargetPlayerId = null;
-
-  initializeRoundRoomOptions(game);
-
-  game.updatedAt = now;
-  const aliveCount = game.players.filter((p) => p.status === 'ALIVE').length;
-  addGameLog(
-    game,
-    `ROUND ${String(game.round).padStart(2, '0')} 시작! 대화 시간이 시작되었습니다. (${aliveCount}명 생존)`,
-    'phase'
-  );
-}
-
-// Check timer & auto transitions
-function processGameTimeouts(game: GameState) {
-  if (game.status !== 'PLAYING') return;
-
-  const now = Date.now();
-
-  // 1. 대화 종료 -> 방 선택
-  if (game.phase === 'PRE_SELECTION_DISCUSSION' && game.phaseExpiresAt && now >= game.phaseExpiresAt) {
-    beginRoomSelection(game, now);
-  }
-  // 2. 방 선택 종료 -> 미선택자는 후보 2개 중 자동 확정 -> 특수능력
-  else if (game.phase === 'ROOM_SELECTION' && game.phaseExpiresAt && now >= game.phaseExpiresAt) {
-    autoConfirmMissingRooms(game);
-    beginAbilityAction(game, now);
-  }
-  // 3. 특수능력 종료 -> 방/살인/절도 등 정산 -> 낮 결과
-  else if (game.phase === 'ABILITY_ACTION' && game.phaseExpiresAt && now >= game.phaseExpiresAt) {
-    executeResolveMovement(game);
-  }
-  // 4. 낮 결과 표시 종료 -> 자동 다음 라운드
-  else if (game.phase === 'DAY' && game.phaseExpiresAt && now >= game.phaseExpiresAt) {
-    advanceToNextRound(game, now);
-  }
-}
-
-// Check if all alive players have selected one of their two rooms.
-function checkAllRoomsConfirmed(game: GameState) {
-  if (game.status !== 'PLAYING') return;
-  if (game.phase !== 'ROOM_SELECTION' && game.phase !== 'ROOM_DRAW') return;
-
-  if (allAliveRoomsConfirmed(game)) {
-    beginAbilityAction(game);
-  }
-}
-
-// Periodical server tick
-setInterval(() => {
-  let changed = false;
-  Object.values(games).forEach((game) => {
-    const before = game.updatedAt;
-    processLobbyAutoStart(game);
-    processBotDiscussion(game);
-    processBotAbilityActions(game);
-    processGameTimeouts(game);
-    if (game.updatedAt !== before) changed = true;
-  });
-  if (changed) persistGamesSoon();
-}, 1000);
-
-// ================= API ROUTES =================
-
-// 1. Create a new game
-app.post('/api/games/create', (req: Request, res: Response) => {
-  const { nickname } = req.body;
-  if (!nickname || typeof nickname !== 'string') {
-    res.status(400).json({ error: '닉네임을 입력해주세요.' });
-    return;
-  }
-
-  let code = generateGameCode();
-  while (games[code]) {
-    code = generateGameCode();
-  }
-
-  const hostPlayerId = generateId();
-  const hostPlayer: Player = {
-    id: hostPlayerId,
-    nickname: nickname.trim(),
-    isHost: true,
-    status: 'ALIVE',
-    inventory: { roomPassCount: 1, prisonPassCount: 1 }, // 1 ticket each
-    selectedRoom: null,
-    confirmedRoom: false,
-    currentRoom: null,
-    drawnRoom: null,
-    abilityUsesRemaining: 0,
-    joinedAt: Date.now(),
-  };
-
-  const newGame: GameState = {
-    gameId: code,
-    hostId: hostPlayerId,
-    status: 'LOBBY',
-    mode: 'RANDOM',
-    round: 1,
-    maxRound: 10,
-    phase: 'PRE_SELECTION_DISCUSSION',
-    phaseExpiresAt: null,
-    lobbyAutoStartAt: null,
-    winner: null,
-    winnerReason: null,
-    rooms: ALL_ROOMS,
-    players: [hostPlayer],
-    logs: [],
-    chatMessages: [],
-    settings: { ...DEFAULT_SETTINGS },
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    roleMapping: {},
-    killerKillCount: 0,
-  };
-
-  addGameLog(newGame, `게임 방이 생성되었습니다 (코드: ${code}). HOST: ${hostPlayer.nickname}`);
-  games[code] = newGame;
-
-  res.json({
-    gameId: code,
-    playerId: hostPlayerId,
-    game: sanitizeGameState(newGame, hostPlayerId),
-  });
-});
-
-// 2. Join game
-app.post('/api/games/join', (req: Request, res: Response) => {
-  const { gameId, nickname, playerId } = req.body;
-  const cleanCode = (gameId || '').trim().toUpperCase();
-
-  const game = games[cleanCode];
-  if (!game) {
-    res.status(404).json({ error: '존재하지 않는 게임 코드입니다.' });
-    return;
-  }
-
-  processGameTimeouts(game);
-
-  if (playerId) {
-    const existingPlayer = game.players.find((p) => p.id === playerId);
-    if (existingPlayer) {
-      res.json({
-        gameId: cleanCode,
-        playerId: existingPlayer.id,
-        game: sanitizeGameState(game, existingPlayer.id),
-      });
-      return;
-    }
-  }
-
-  if (game.status !== 'LOBBY') {
-    res.status(400).json({ error: '이미 진행 중이거나 종료된 게임입니다.' });
-    return;
-  }
-
-  const replaceableBotIndex = game.players.length >= 12
-    ? game.players.findIndex((p) => p.isBot)
-    : -1;
-  if (game.players.length >= 12 && replaceableBotIndex < 0) {
-    res.status(400).json({ error: '방 정원(12명)이 이미 가득 찼습니다.' });
-    return;
-  }
-
-  if (!nickname || typeof nickname !== 'string') {
-    res.status(400).json({ error: '닉네임을 입력해주세요.' });
-    return;
-  }
-
-  const cleanNickname = nickname.trim();
-  if (!cleanNickname) {
-    res.status(400).json({ error: '닉네임을 입력해주세요.' });
-    return;
-  }
-  if (game.players.some((p) => p.nickname.toLowerCase() === cleanNickname.toLowerCase())) {
-    res.status(400).json({ error: '이미 사용 중인 닉네임입니다. 다른 닉네임을 사용해주세요.' });
-    return;
-  }
-
-  // If BOTs filled the room first, a late human can take one BOT seat before auto-start.
-  if (replaceableBotIndex >= 0) {
-    const [replacedBot] = game.players.splice(replaceableBotIndex, 1);
-    const stored = game as StoredGame;
-    if (stored.botBrains && replacedBot) delete stored.botBrains[replacedBot.id];
-    if (replacedBot) addGameLog(game, `${replacedBot.nickname}(BOT) 자리를 실제 참가자가 대신합니다.`);
-  }
-
-  const newPlayerId = generateId();
-  const newPlayer: Player = {
-    id: newPlayerId,
-    nickname: cleanNickname,
-    isHost: false,
-    status: 'ALIVE',
-    inventory: { roomPassCount: 1, prisonPassCount: 1 },
-    selectedRoom: null,
-    confirmedRoom: false,
-    currentRoom: null,
-    drawnRoom: null,
-    abilityUsesRemaining: 0,
-    joinedAt: Date.now(),
-  };
-
-  game.players.push(newPlayer);
-  game.updatedAt = Date.now();
-  addGameLog(game, `${newPlayer.nickname} 님이 입장했습니다. (${game.players.length}/12)`);
-  if (game.players.length === 12) {
-    game.lobbyAutoStartAt = Date.now() + 10_000;
-    addGameLog(game, `[자동 시작] 12명이 모두 모였습니다. 10초 후 게임을 자동 시작합니다.`, 'phase');
-  }
-
-  res.json({
-    gameId: cleanCode,
-    playerId: newPlayerId,
-    game: sanitizeGameState(game, newPlayerId),
-  });
-});
-
-// 2b. Leave lobby and free the seat
-app.post('/api/games/:gameId/leave', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.status !== 'LOBBY') {
-    res.status(400).json({ error: '게임 시작 후에는 참가 슬롯에서 나갈 수 없습니다. 브라우저를 닫아도 같은 기기에서 다시 접속할 수 있습니다.' });
-    return;
-  }
-
-  const index = game.players.findIndex((p) => p.id === playerId);
-  if (index < 0) {
-    res.status(404).json({ error: '플레이어를 찾을 수 없습니다.' });
-    return;
-  }
-
-  const leaving = game.players[index];
-  game.players.splice(index, 1);
-  if (game.players.length < 12) game.lobbyAutoStartAt = null;
-
-  if (game.players.length === 0) {
-    delete games[gameId];
-    res.json({ success: true, deleted: true });
-    return;
-  }
-
-  if (leaving.id === game.hostId) {
-    const nextHost = game.players.slice().sort((a, b) => a.joinedAt - b.joinedAt)[0];
-    game.players.forEach((p) => (p.isHost = p.id === nextHost.id));
-    game.hostId = nextHost.id;
-    addGameLog(game, `${leaving.nickname} 방장이 나가 ${nextHost.nickname} 님에게 방장이 이전되었습니다.`);
-  } else {
-    addGameLog(game, `${leaving.nickname} 님이 로비에서 나갔습니다. (${game.players.length}/12)`);
-  }
-  game.updatedAt = Date.now();
-  res.json({ success: true });
-});
-
-// 3. Get Game State
-app.get('/api/games/:gameId', (req: Request, res: Response) => {
-  const gameId = (req.params.gameId || '').toUpperCase();
-  const playerId = req.query.playerId as string | undefined;
-
-  const game = games[gameId];
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-
-  processLobbyAutoStart(game);
-  processGameTimeouts(game);
-
-  res.json({
-    game: sanitizeGameState(game, playerId),
-  });
-});
-
-// 4. Change game mode or mapping
-app.post('/api/games/:gameId/mode', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId, mode, roleMapping } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.hostId !== playerId) {
-    res.status(403).json({ error: '방장만 설정을 변경할 수 있습니다.' });
-    return;
-  }
-
-  if (mode && (mode === 'FIXED' || mode === 'RANDOM')) {
-    game.mode = mode;
-  }
-  if (roleMapping) {
-    game.roleMapping = roleMapping;
-  }
-  game.updatedAt = Date.now();
-
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 5. Host auto-fill with bot players
-app.post('/api/games/:gameId/host/fill-bots', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.hostId !== playerId) {
-    res.status(403).json({ error: '방장만 실행할 수 있습니다.' });
-    return;
-  }
-  if (game.status !== 'LOBBY') {
-    res.status(400).json({ error: '로비에서만 봇을 추가할 수 있습니다.' });
-    return;
-  }
-
-  const usedNames = new Set(game.players.map((p) => p.nickname));
-  while (game.players.length < 12) {
-    const slotIdx = game.players.length + 1;
-    const botId = generateId();
-    const availableNames = BOT_NAME_POOL.filter((name) => !usedNames.has(name));
-    const baseName = availableNames.length ? pickOne(availableNames) : `BOT ${slotIdx}`;
-    usedNames.add(baseName);
-    game.players.push({
-      id: botId,
-      nickname: baseName,
-      isHost: false,
-      isBot: true,
-      status: 'ALIVE',
-      inventory: { roomPassCount: 1, prisonPassCount: 1 },
-      selectedRoom: null,
-      confirmedRoom: false,
-      currentRoom: null,
-      drawnRoom: null,
-      abilityUsesRemaining: 0,
-      joinedAt: Date.now(),
-    });
-    ensureBotBrain(game, botId);
-  }
-
-  game.updatedAt = Date.now();
-  game.lobbyAutoStartAt = Date.now() + 10_000;
-  const difficultyName = game.settings.botDifficulty === 'HARD' ? '어려움' : game.settings.botDifficulty === 'EASY' ? '쉬움' : '보통';
-  addGameLog(game, `빈자리가 규칙 기반 BOT으로 채워졌습니다. (BOT 난이도: ${difficultyName})`);
-  addGameLog(game, `[자동 시작] 10초 후 게임을 자동 시작합니다.`, 'phase');
-
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 6. Start Game (HOST can start immediately; otherwise 12명 모이면 10초 후 자동 시작)
-app.post('/api/games/:gameId/start', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.hostId !== playerId) {
-    res.status(403).json({ error: '방장만 즉시 시작할 수 있습니다.' });
-    return;
-  }
-  if (game.players.length < 12) {
-    res.status(400).json({
-      error: `총 12명의 플레이어가 필요합니다. (현재: ${game.players.length}명)`,
-    });
-    return;
-  }
-
-  startGameInternal(game);
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 7. Draw Room (Reveals card options or generates them)
-app.post('/api/games/:gameId/draw-room', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId, usePass, designatedRoom } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.status !== 'PLAYING') {
-    res.status(400).json({ error: '게임이 진행 중이 아닙니다.' });
-    return;
-  }
-
-  const player = game.players.find((p) => p.id === playerId);
-  if (!player) {
-    res.status(404).json({ error: '플레이어를 찾을 수 없습니다.' });
-    return;
-  }
-  if (player.status !== 'ALIVE') {
-    res.status(400).json({ error: '사망하거나 제외된 플레이어는 방을 뽑을 수 없습니다.' });
-    return;
-  }
-
-  // If in PRISON
-  if (player.currentRoom === 'PRISON') {
-    player.confirmedRoom = true;
-    player.roomConfirmed = true;
-    checkAllRoomsConfirmed(game);
-    res.json({ success: true, room: 'PRISON', game: sanitizeGameState(game, playerId) });
-    return;
-  }
-
-  if (usePass && designatedRoom && ALL_ROOMS.includes(designatedRoom)) {
-    if ((player.inventory?.roomPassCount || 0) <= 0) {
-      res.status(400).json({ error: '보유한 방 지정권이 없습니다.' });
-      return;
-    }
-    player.inventory.roomPassCount -= 1;
-    player.usedRoomPassThisRound = true;
-    player.selectedRoom = designatedRoom;
-    player.drawnRoom = designatedRoom;
-    player.currentRoom = designatedRoom;
-    player.confirmedRoom = true;
-    player.roomConfirmed = true;
-    player.isRoomRevealed = true;
-  } else {
-    // Generate candidates if not existing
-    if (!player.randomRoomOptions || player.randomRoomOptions.length < 2) {
-      player.randomRoomOptions = generateTwoDistinctRooms();
-      player.roomOptionsGenerated = true;
-    }
-    player.isRoomRevealed = true;
-  }
-
-  game.updatedAt = Date.now();
-  checkAllRoomsConfirmed(game);
-
-  res.json({
-    success: true,
-    options: player.randomRoomOptions,
-    selectedRoom: player.selectedRoom,
-    game: sanitizeGameState(game, playerId),
-  });
-});
-
-// 7b. Select Room (Player selects 1 of the 2 options, then confirms)
-app.post('/api/games/:gameId/select-room', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId, room, confirm, usePass } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.status !== 'PLAYING') {
-    res.status(400).json({ error: '게임이 진행 중이 아닙니다.' });
-    return;
-  }
-
-  const player = game.players.find((p) => p.id === playerId);
-  if (!player) {
-    res.status(404).json({ error: '플레이어를 찾을 수 없습니다.' });
-    return;
-  }
-  if (player.status !== 'ALIVE') {
-    res.status(400).json({ error: '사망하거나 제외된 플레이어는 방을 선택할 수 없습니다.' });
-    return;
-  }
-
-  if (player.confirmedRoom || player.roomConfirmed) {
-    res.status(400).json({ error: '이미 방 선택을 확정했습니다. 변경할 수 없습니다.' });
-    return;
-  }
-
-  if (!player.randomRoomOptions || player.randomRoomOptions.length < 2) {
-    player.randomRoomOptions = generateTwoDistinctRooms();
-    player.roomOptionsGenerated = true;
-  }
-
-  if (usePass) {
-    if ((player.inventory?.roomPassCount || 0) <= 0) {
-      res.status(400).json({ error: '보유한 방 지정권이 없습니다.' });
-      return;
-    }
-    if (!ALL_ROOMS.includes(room)) {
-      res.status(400).json({ error: '유효한 방(A~F)을 지정해주세요.' });
-      return;
-    }
-    player.selectedRoom = room;
-    if (confirm) {
-      player.inventory.roomPassCount -= 1;
-      player.usedRoomPassThisRound = true;
-      player.confirmedRoom = true;
-      player.roomConfirmed = true;
-      player.currentRoom = room;
-      player.isRoomRevealed = true;
-      checkAllRoomsConfirmed(game);
-    }
-  } else {
-    // Regular selection from 2 candidates
-    if (room && !player.randomRoomOptions.includes(room)) {
-      res.status(400).json({ error: '제시된 두 개의 방 후보 중에서만 선택할 수 있습니다.' });
-      return;
-    }
-    player.selectedRoom = room;
-    player.isRoomRevealed = true;
-
-    if (confirm) {
-      if (!player.selectedRoom) {
-        res.status(400).json({ error: '이동할 방을 먼저 선택해주세요.' });
-        return;
-      }
-      player.confirmedRoom = true;
-      player.roomConfirmed = true;
-      player.currentRoom = player.selectedRoom;
-      checkAllRoomsConfirmed(game);
-    }
-  }
-
-  game.updatedAt = Date.now();
-  res.json({
-    success: true,
-    selectedRoom: player.selectedRoom,
-    confirmed: player.confirmedRoom || player.roomConfirmed,
-    game: sanitizeGameState(game, playerId),
-  });
-});
-
-// 8. Warden Action: Send player to Prison
-app.post('/api/games/:gameId/warden-jail', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId, targetPlayerId } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-
-  const requester = game.players.find((p) => p.id === playerId);
-  if (!requester || requester.roleId !== 'warden') {
-    res.status(403).json({ error: '교도관만 감옥 수감 능력을 사용할 수 있습니다.' });
-    return;
-  }
-  if (requester.status !== 'ALIVE') {
-    res.status(400).json({ error: '생존한 교도관만 능력을 사용할 수 있습니다.' });
-    return;
-  }
-  if (game.phase !== 'ABILITY_ACTION') {
-    res.status(400).json({ error: '교도관 능력은 방 선택 후 특수능력 단계에서만 사용할 수 있습니다.' });
-    return;
-  }
-  if (game.wardenTargetPlayerId) {
-    res.status(400).json({ error: '이번 라운드의 감옥 대상을 이미 지정했습니다.' });
-    return;
-  }
-  if (targetPlayerId && requester.abilityUsesRemaining <= 0) {
-    res.status(400).json({ error: '교도관 능력 사용 횟수를 모두 소진했습니다.' });
-    return;
-  }
-
-  if (targetPlayerId) {
-    const target = game.players.find((p) => p.id === targetPlayerId);
-    if (!target || target.status !== 'ALIVE' || target.id === requester.id) {
-      res.status(400).json({ error: '본인을 제외한 유효한 생존 플레이어를 선택해주세요.' });
-      return;
-    }
-
-    // 방 선택 결과는 보존하고 실제 이동 위치만 감옥으로 덮어쓴다.
-    // 탈옥권을 쓰면 본래 선택했던 방으로 되돌아갈 수 있다.
-    target.currentRoom = 'PRISON';
-    game.wardenTargetPlayerId = target.id;
-    requester.abilityUsesRemaining = Math.max(0, requester.abilityUsesRemaining - 1);
-
-    addGameLog(
-      game,
-      `[교도관 능력 발동] 교도관이 ${target.nickname} 님을 감옥(PRISON)으로 격리했습니다.`,
-      'warden'
-    );
-  } else {
-    game.wardenTargetPlayerId = null;
-  }
-
-  game.updatedAt = Date.now();
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 9. Use Prison Pass (탈옥권)
-app.post('/api/games/:gameId/use-prison-pass', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-
-  if (game.phase !== 'ABILITY_ACTION') {
-    res.status(400).json({ error: '탈옥권은 특수능력 단계에서만 사용할 수 있습니다.' });
-    return;
-  }
-
-  const player = game.players.find((p) => p.id === playerId);
-  if (!player || player.currentRoom !== 'PRISON') {
-    res.status(400).json({ error: '감옥 상태가 아닙니다.' });
-    return;
-  }
-
-  if ((player.inventory?.prisonPassCount || 0) <= 0) {
-    res.status(400).json({ error: '보유한 탈옥권이 없습니다.' });
-    return;
-  }
-
-  player.inventory.prisonPassCount -= 1;
-  player.usedPrisonPassThisRound = true;
-  player.currentRoom = player.selectedRoom || null; // Return to the room chosen before imprisonment
-  player.confirmedRoom = true;
-  player.roomConfirmed = true;
-
-  addGameLog(game, `${player.nickname} 님이 탈옥권을 사용하여 감옥에서 벗어났습니다.`, 'warden');
-  game.updatedAt = Date.now();
-
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 10. Gambler Bet
-app.post('/api/games/:gameId/gambler-bet', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId, betTeam } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-
-  if (game.phase !== 'ABILITY_ACTION') {
-    res.status(400).json({ error: '도박꾼 베팅은 특수능력 단계에서만 할 수 있습니다.' });
-    return;
-  }
-
-  const player = game.players.find((p) => p.id === playerId);
-  if (!player || player.roleId !== 'gambler') {
-    res.status(403).json({ error: '도박꾼만 베팅할 수 있습니다.' });
-    return;
-  }
-
-  if (betTeam !== 'citizen' && betTeam !== 'killer') {
-    res.status(400).json({ error: '시민 또는 살인마 진영에만 베팅할 수 있습니다.' });
-    return;
-  }
-
-  player.gamblerBet = betTeam;
-  player.abilityUsesRemaining = 0;
-  game.updatedAt = Date.now();
-
-  res.json({ success: true, bet: betTeam, game: sanitizeGameState(game, playerId) });
-});
-
-// 11. Police Arrest
-app.post('/api/games/:gameId/police-arrest', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId, targetPlayerId } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.status !== 'PLAYING') {
-    res.status(400).json({ error: '게임이 진행 중이 아닙니다.' });
-    return;
-  }
-  if (game.phase !== 'ABILITY_ACTION') {
-    res.status(400).json({ error: '경찰 체포는 특수능력 단계에서만 사용할 수 있습니다.' });
-    return;
-  }
-
-  const requester = game.players.find((p) => p.id === playerId);
-  if (!requester || requester.roleId !== 'police') {
-    res.status(403).json({ error: '경찰만 체포 기능을 실행할 수 있습니다.' });
-    return;
-  }
-  if (requester.status !== 'ALIVE') {
-    res.status(400).json({ error: '사망하거나 제외된 경찰은 행동할 수 없습니다.' });
-    return;
-  }
-  if (requester.abilityUsesRemaining <= 0) {
-    res.status(400).json({ error: '경찰 체포권을 이미 사용했습니다.' });
-    return;
-  }
-
-  const target = game.players.find((p) => p.id === targetPlayerId);
-  if (!target || target.status !== 'ALIVE' || target.id === requester.id) {
-    res.status(400).json({ error: '본인을 제외한 생존 플레이어만 체포할 수 있습니다.' });
-    return;
-  }
-  requester.abilityUsesRemaining = 0;
-
-  const isRealKiller = target.roleId === 'killer';
-
-  if (isRealKiller) {
-    target.status = 'REMOVED';
-    addGameLog(
-      game,
-      `[체포 대성공] 경찰이 진짜 살인마 ${target.nickname}을(를) 완벽하게 검거했습니다!`,
-      'arrest'
-    );
-    game.status = 'GAME_OVER';
-    game.winner = 'citizen';
-    game.winnerReason = `경찰이 진짜 살인마(${target.nickname})를 체포하여 시민 진영이 즉시 승리했습니다!`;
-    addGameLog(game, `[게임 종료] 시민 진영 승리! - ${game.winnerReason}`, 'win');
-    calculateEndGameWinners(game);
-  } else {
-    // Wrong arrest: Target and Police both REMOVED!
-    target.status = 'REMOVED';
-    requester.status = 'REMOVED';
-
-    addGameLog(
-      game,
-      `[오검거 발생] 경찰이 ${target.nickname} 님을 체포하였으나 살인마가 아니었습니다. 체포 대상과 경찰 모두 게임에서 제외(REMOVED)됩니다.`,
-      'arrest'
-    );
-  }
-
-  game.updatedAt = Date.now();
-  evaluateWinCondition(game);
-
-  res.json({
-    success: true,
-    isRealKiller,
-    targetNickname: target.nickname,
-    game: sanitizeGameState(game, playerId),
-  });
-});
-
-// 12. Corrupt Police Arrest (동귀어진 Mutual Destruction)
-app.post('/api/games/:gameId/corrupt-police-arrest', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId, targetPlayerId } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-
-  if (game.phase !== 'ABILITY_ACTION') {
-    res.status(400).json({ error: '부패경찰 체포는 특수능력 단계에서만 사용할 수 있습니다.' });
-    return;
-  }
-
-  const requester = game.players.find((p) => p.id === playerId);
-  if (!requester || requester.roleId !== 'corrupt_police') {
-    res.status(403).json({ error: '부패경찰만 사용할 수 있습니다.' });
-    return;
-  }
-  if (requester.status !== 'ALIVE') {
-    res.status(400).json({ error: '생존 상태에서만 사용 가능합니다.' });
-    return;
-  }
-  if (requester.abilityUsesRemaining <= 0) {
-    res.status(400).json({ error: '동귀어진 체포권을 이미 사용했습니다.' });
-    return;
-  }
-
-  const target = game.players.find((p) => p.id === targetPlayerId);
-  if (!target || target.status !== 'ALIVE' || target.id === requester.id) {
-    res.status(400).json({ error: '본인을 제외한 생존한 대상만 체포할 수 있습니다.' });
-    return;
-  }
-
-  // Mutual destruction: Both REMOVED!
-  target.status = 'REMOVED';
-  requester.status = 'REMOVED';
-  requester.abilityUsesRemaining = 0;
-
-  addGameLog(
-    game,
-    `[부패경찰 동귀어진 체포] 부패경찰(${requester.nickname})이 ${target.nickname} 님을 체포하며 함께 게임에서 영구 제외(REMOVED)되었습니다!`,
-    'arrest'
-  );
-
-  game.updatedAt = Date.now();
-  evaluateWinCondition(game);
-
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 13. Skip Discussion to Selection
-app.post('/api/games/:gameId/skip-discussion', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.hostId !== playerId) {
-    res.status(403).json({ error: '방장만 대화를 건너뛸 수 있습니다.' });
-    return;
-  }
-  if (game.phase !== 'PRE_SELECTION_DISCUSSION') {
-    res.status(400).json({ error: '사전 대화 단계가 아닙니다.' });
-    return;
-  }
-
-  beginRoomSelection(game);
-
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 14. Next Round
-app.post('/api/games/:gameId/next-round', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.hostId !== playerId) {
-    res.status(403).json({ error: '방장만 다음 라운드로 진행할 수 있습니다.' });
-    return;
-  }
-  if (game.status !== 'PLAYING') {
-    res.status(400).json({ error: '게임이 진행 중이 아닙니다.' });
-    return;
-  }
-  if (game.phase !== 'DAY') {
-    res.status(400).json({ error: '다음 라운드는 낮 결과 발표가 끝난 뒤 자동으로 시작됩니다.' });
-    return;
-  }
-
-  advanceToNextRound(game);
-
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 14b. Set Phase (e.g. DAY -> DISCUSSION)
-app.post('/api/games/:gameId/set-phase', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId, phase } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.hostId !== playerId) {
-    res.status(403).json({ error: '방장만 단계를 변경할 수 있습니다.' });
-    return;
-  }
-
-  game.phase = phase;
-  game.phaseExpiresAt = null;
-  game.updatedAt = Date.now();
-  addGameLog(game, `게임 단계가 변경되었습니다. (${phase})`, 'phase');
-
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 15. Force resolve
-app.post('/api/games/:gameId/resolve-round', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.hostId !== playerId) {
-    res.status(403).json({ error: '방장만 강제 정산할 수 있습니다.' });
-    return;
-  }
-
-  executeResolveMovement(game);
-
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 16. Host Modify Player Status
-app.post('/api/games/:gameId/host/update-player', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId, targetPlayerId, newStatus, newRoom } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.hostId !== playerId) {
-    res.status(403).json({ error: '방장만 플레이어 상태를 수정할 수 있습니다.' });
-    return;
-  }
-
-  const target = game.players.find((p) => p.id === targetPlayerId);
-  if (!target) {
-    res.status(404).json({ error: '대상 플레이어를 찾을 수 없습니다.' });
-    return;
-  }
-
-  if (newStatus && ['ALIVE', 'DEAD', 'REMOVED'].includes(newStatus)) {
-    target.status = newStatus as PlayerStatus;
-  }
-  if (newRoom && [...ALL_ROOMS, 'PRISON'].includes(newRoom)) {
-    target.currentRoom = newRoom as RoomLocation;
-  }
-
-  game.updatedAt = Date.now();
-  evaluateWinCondition(game);
-
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 17. Host End Game
-app.post('/api/games/:gameId/host/end-game', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId, winner, winnerReason } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.hostId !== playerId) {
-    res.status(403).json({ error: '방장만 게임을 종료할 수 있습니다.' });
-    return;
-  }
-
-  game.status = 'GAME_OVER';
-  game.winner = winner as TeamType;
-  game.winnerReason = winnerReason || '방장에 의해 게임이 종료되었습니다.';
-  game.updatedAt = Date.now();
-
-  calculateEndGameWinners(game);
-
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 18. Host Pause / Resume
-app.post('/api/games/:gameId/host/toggle-pause', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.hostId !== playerId) {
-    res.status(403).json({ error: '방장만 일시정지할 수 있습니다.' });
-    return;
-  }
-
-  if (game.status === 'PLAYING') {
-    game.status = 'PAUSED';
-  } else if (game.status === 'PAUSED') {
-    game.status = 'PLAYING';
-    if (game.phase === 'PRE_SELECTION_DISCUSSION') {
-      game.phaseExpiresAt = Date.now() + 60000;
-    } else if (game.phase === 'ROOM_SELECTION') {
-      game.phaseExpiresAt = Date.now() + (game.settings.roomSelectionTimeSeconds || 15) * 1000;
-    } else if (game.phase === 'ABILITY_ACTION') {
-      game.phaseExpiresAt = Date.now() + (game.settings.abilityActionTimeSeconds || 15) * 1000;
-    } else if (game.phase === 'DAY') {
-      game.phaseExpiresAt = Date.now() + (game.settings.dayResultTimeSeconds || 8) * 1000;
-    }
-  }
-
-  game.updatedAt = Date.now();
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 19. Restart Game
-app.post('/api/games/:gameId/restart', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.hostId !== playerId) {
-    res.status(403).json({ error: '방장만 다시 시작할 수 있습니다.' });
-    return;
-  }
-
-  game.status = 'LOBBY';
-  game.round = 1;
-  game.phase = 'PRE_SELECTION_DISCUSSION';
-  game.phaseExpiresAt = null;
-  game.lobbyAutoStartAt = game.players.length >= 12 ? Date.now() + 10_000 : null;
-  game.winner = null;
-  game.winnerReason = null;
-  game.killerKillCount = 0;
-  game.wardenTargetPlayerId = null;
-
-  game.players.forEach((p) => {
-    p.roleId = undefined;
-    p.status = 'ALIVE';
-    p.selectedRoom = null;
-    p.confirmedRoom = false;
-    p.currentRoom = null;
-    p.drawnRoom = null;
-    p.abilityUsesRemaining = 0;
-  });
-
-  game.logs = [];
+  game.pendingWinner = null;
+  game.pendingWinnerReason = null;
+  game.nightActions = {};
+  game.votes = {};
   game.chatMessages = [];
-  (game as StoredGame).botBrains = {};
-  game.updatedAt = Date.now();
-
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// 20. Update Settings
-app.post('/api/games/:gameId/host/update-settings', (req: Request, res: Response) => {
-  const gameId = req.params.gameId.toUpperCase();
-  const { playerId, settings } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-  if (game.hostId !== playerId) {
-    res.status(403).json({ error: '방장만 설정을 수정할 수 있습니다.' });
-    return;
-  }
-
-  if (settings) {
-    game.settings = { ...game.settings, ...settings };
-    if (!['EASY', 'NORMAL', 'HARD'].includes(game.settings.botDifficulty)) {
-      game.settings.botDifficulty = 'NORMAL';
-    }
-    if (settings.maxRounds) game.maxRound = settings.maxRounds;
-  }
-
-  game.updatedAt = Date.now();
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
-});
-
-// Public room chat (near-real-time through the existing 1s game-state sync)
-const lastChatAt: Record<string, number> = {};
-app.post('/api/games/:gameId/chat', (req: Request, res: Response) => {
-  const gameId = (req.params.gameId || '').toUpperCase();
-  const { playerId, message } = req.body;
-  const game = games[gameId];
-
-  if (!game) {
-    res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
-    return;
-  }
-
-  const player = game.players.find((p) => p.id === playerId);
-  if (!player) {
-    res.status(404).json({ error: '플레이어를 찾을 수 없습니다.' });
-    return;
-  }
-
-  if (game.status === 'GAME_OVER') {
-    res.status(400).json({ error: '종료된 게임에서는 채팅을 보낼 수 없습니다.' });
-    return;
-  }
-
-  if (game.status === 'PLAYING' && game.phase !== 'PRE_SELECTION_DISCUSSION') {
-    res.status(400).json({ error: '채팅은 대화 시간에만 보낼 수 있습니다.' });
-    return;
-  }
-
-  if (game.status !== 'LOBBY' && player.status !== 'ALIVE') {
-    res.status(403).json({ error: '사망하거나 제외된 플레이어는 채팅을 읽을 수만 있습니다.' });
-    return;
-  }
-
-  if (typeof message !== 'string') {
-    res.status(400).json({ error: '메시지를 입력해주세요.' });
-    return;
-  }
-
-  const cleanMessage = message.replace(/\s+/g, ' ').trim();
-  if (!cleanMessage) {
-    res.status(400).json({ error: '메시지를 입력해주세요.' });
-    return;
-  }
-  if (cleanMessage.length > 300) {
-    res.status(400).json({ error: '채팅은 최대 300자까지 입력할 수 있습니다.' });
-    return;
-  }
-
-  const throttleKey = `${gameId}:${playerId}`;
-  const now = Date.now();
-  if (lastChatAt[throttleKey] && now - lastChatAt[throttleKey] < 400) {
-    res.status(429).json({ error: '메시지를 너무 빠르게 보내고 있습니다.' });
-    return;
-  }
-  lastChatAt[throttleKey] = now;
-
-  if (!game.chatMessages) game.chatMessages = [];
-  game.chatMessages.push({
-    id: generateId(),
-    playerId: player.id,
-    nickname: player.nickname,
-    message: cleanMessage,
-    timestamp: now,
-    round: game.round,
-    phase: game.phase,
-    isBot: false,
+  game.events = [];
+  game.lastNightResult = null;
+  game.lastExecutionResult = null;
+  game.players.forEach((p) => {
+    p.status = 'ALIVE'; delete p.roleId; delete p.role; p.revealedRole = false; p.mayorRevealed = false; p.privateClues = []; if (p.isBot) p.botBrain = initBrain();
   });
-
-  // A fresh human statement can pull NORMAL/HARD bots into the conversation sooner.
-  if (game.status === 'PLAYING' && game.phase === 'PRE_SELECTION_DISCUSSION') {
-    const difficulty = game.settings.botDifficulty || 'NORMAL';
-    if (difficulty !== 'EASY') {
-      game.players.filter((p) => p.isBot && p.status === 'ALIVE').forEach((bot) => {
-        const brain = ensureBotBrain(game, bot.id);
-        if (brain.nextChatAt != null) {
-          const responseAt = now + randInt(difficulty === 'HARD' ? 2 : 3, difficulty === 'HARD' ? 5 : 7) * 1000;
-          brain.nextChatAt = Math.min(brain.nextChatAt, responseAt);
-        }
-      });
-    }
-  }
-
-  if (game.chatMessages.length > 200) {
-    game.chatMessages = game.chatMessages.slice(-200);
-  }
-
-  game.updatedAt = now;
-  res.json({ success: true, game: sanitizeGameState(game, playerId) });
+  persistSoon();
+  res.json({ game: sanitize(game, host.id) });
 });
 
-// Lightweight health endpoint for Render/Railway/Fly.io health checks
-app.get('/api/health', (_req: Request, res: Response) => {
-  res.json({ ok: true, games: Object.keys(games).length, uptime: Math.round(process.uptime()) });
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true, version: GAME_VERSION, games: Object.keys(games).length, uptime: Math.round(process.uptime()) });
 });
 
-// ================= VITE INTEGRATION =================
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
   }
-
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Killer Game Server running on port ${PORT}`);
-    console.log(`[store] data file: ${DATA_FILE}`);
+    console.log(`Killer Game Mafia v6 running on port ${PORT}`);
+    console.log(`[store] ${DATA_FILE}`);
   });
 }
 
