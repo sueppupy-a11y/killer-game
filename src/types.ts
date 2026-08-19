@@ -5,6 +5,7 @@ export type PlayerStatus = 'ALIVE' | 'DEAD' | 'REMOVED' | 'PRISON';
 export type GamePhase =
   | 'ROOM_DRAW'
   | 'ROOM_SELECTION'
+  | 'ABILITY_ACTION'
   | 'DAY'
   | 'DISCUSSION'
   | 'PRE_SELECTION_DISCUSSION'
@@ -94,6 +95,8 @@ export interface GameSettings {
   maxRounds: number;
   preDiscussionTimeSeconds: number; // 60s
   roomSelectionTimeSeconds: number; // 15s
+  abilityActionTimeSeconds: number; // 특수능력 선택 시간
+  dayResultTimeSeconds: number; // 낮 결과 발표 유지 시간
   allowRoleAbilities: boolean;
   killerWinConditionText: string;
   citizenWinConditionText: string;

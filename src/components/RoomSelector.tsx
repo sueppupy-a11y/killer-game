@@ -238,7 +238,7 @@ export const RoomSelector: React.FC<RoomSelectorProps> = ({
                   다른 참가자들이 방을 선택하고 있습니다...
                 </div>
                 <div className="text-[11px] text-zinc-400">
-                  모든 참가자({confirmedCount}/{totalAlive}명)가 선택을 확정하면 즉시 낮(DAY)으로 전환됩니다.
+                  모든 참가자({confirmedCount}/{totalAlive}명)가 선택을 확정하면 즉시 특수능력 선택 단계로 전환됩니다.
                 </div>
               </div>
 

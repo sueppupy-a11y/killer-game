@@ -42,6 +42,7 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
 }) => {
   const roleId = currentPlayer.roleId;
   const isAlive = currentPlayer.status === 'ALIVE';
+  const isAbilityPhase = game.phase === 'ABILITY_ACTION';
 
   const [selectedTargetId, setSelectedTargetId] = useState<string>('');
   const [confirmModalType, setConfirmModalType] = useState<
@@ -60,6 +61,14 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
 
   return (
     <div className="w-full space-y-4" id="role-ability-hub">
+      <div className={`p-4 rounded-2xl border ${isAbilityPhase ? 'bg-yellow-950/30 border-yellow-700/60' : 'bg-zinc-900/70 border-zinc-800'}`}>
+        <div className="text-sm font-black text-white">{isAbilityPhase ? '⚡ 지금은 특수능력 선택 단계입니다' : '특수능력 대기 중'}</div>
+        <p className="mt-1 text-xs text-zinc-400">
+          {isAbilityPhase
+            ? '사용형 직업은 제한 시간 안에 능력을 실행하세요. 사용하지 않아도 시간이 끝나면 자동으로 낮 결과로 넘어갑니다.'
+            : '특수능력 버튼은 방 선택이 끝난 뒤 자동으로 활성화됩니다.'}
+        </p>
+      </div>
       {/* Shared inventory / emergency actions */}
       <div className="p-4 rounded-2xl bg-zinc-900/80 border border-zinc-800 space-y-3">
         <div className="flex items-center justify-between gap-3">
@@ -73,7 +82,7 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
           </div>
         </div>
 
-        {currentPlayer.currentRoom === 'PRISON' && isAlive && (currentPlayer.inventory?.prisonPassCount || 0) > 0 && (
+        {currentPlayer.currentRoom === 'PRISON' && isAlive && isAbilityPhase && (currentPlayer.inventory?.prisonPassCount || 0) > 0 && (
           <button
             type="button"
             disabled={isSubmitting}
@@ -133,7 +142,7 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
             </p>
           </div>
 
-          {isAlive && currentPlayer.abilityUsesRemaining > 0 && (
+          {isAlive && isAbilityPhase && currentPlayer.abilityUsesRemaining > 0 && (
             <div className="flex gap-2 pt-1">
               <select
                 value={selectedTargetId}
@@ -185,7 +194,7 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
             </p>
           </div>
 
-          {isAlive && currentPlayer.abilityUsesRemaining > 0 && (
+          {isAlive && isAbilityPhase && currentPlayer.abilityUsesRemaining > 0 && (
             <div className="flex gap-2 pt-1">
               <select
                 value={selectedTargetId}
@@ -393,14 +402,13 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
               </div>
               <div>
                 <h4 className="font-bold text-sm text-white">교도관 — 감옥 격리 권한</h4>
-                <p className="text-xs text-blue-200">라운드 시작 전 1명을 감옥으로 수감</p>
+                <p className="text-xs text-blue-200">방 선택 후 1명을 감옥으로 수감</p>
               </div>
             </div>
           </div>
 
           <p className="text-xs text-zinc-300 leading-relaxed">
-            감옥에 격리된 플레이어는 이번 라운드 일반 A~F 방 뽑기를 하지 않고 감옥(PRISON)에
-            수감됩니다.
+            방 선택이 끝난 뒤 대상의 실제 이동 위치를 감옥(PRISON)으로 바꿉니다. 대상이 탈옥권을 사용하면 원래 선택했던 방으로 돌아갑니다.
           </p>
 
           <div className="flex items-center justify-between text-[11px] text-zinc-400">
@@ -414,7 +422,7 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
             </div>
           )}
 
-          {isAlive && game.phase === 'PRE_SELECTION_DISCUSSION' && !game.wardenTargetPlayerId && currentPlayer.abilityUsesRemaining > 0 && (
+          {isAlive && isAbilityPhase && !game.wardenTargetPlayerId && currentPlayer.abilityUsesRemaining > 0 && (
             <div className="flex gap-2 pt-1">
               <select
                 value={selectedTargetId}
@@ -527,7 +535,7 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
             )}
           </div>
 
-          {!currentPlayer.gamblerBet && isAlive ? (
+          {!currentPlayer.gamblerBet && isAlive && isAbilityPhase ? (
             <div className="space-y-2 pt-1">
               <div className="text-xs text-zinc-300">승리할 것으로 예상되는 진영을 선택하십시오:</div>
               <div className="grid grid-cols-2 gap-2">
@@ -553,10 +561,14 @@ export const RoleAbilityHub: React.FC<RoleAbilityHubProps> = ({
                 </button>
               </div>
             </div>
-          ) : (
+          ) : currentPlayer.gamblerBet ? (
             <div className="text-xs text-zinc-300 bg-zinc-900/60 p-3 rounded-xl border border-zinc-800">
               베팅 완료: <strong>{currentPlayer.gamblerBet === 'citizen' ? '시민 진영' : '살인마 진영'}</strong>이
               승리하고 본인이 끝까지 생존하면 개인 승리합니다.
+            </div>
+          ) : (
+            <div className="text-xs text-zinc-400 bg-zinc-900/60 p-3 rounded-xl border border-zinc-800 text-center">
+              방 선택이 끝난 뒤 <strong className="text-yellow-400">특수능력 선택 단계</strong>에서 베팅할 수 있습니다.
             </div>
           )}
         </div>

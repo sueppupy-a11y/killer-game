@@ -119,6 +119,22 @@ export default function App() {
     if (gameState?.status === 'GAME_OVER') setActiveTab('game');
   }, [gameState?.status]);
 
+  // Phase changes must move every player to the screen they need right now.
+  // 대화 -> 방 선택 -> 능력 -> 낮 결과 -> 다음 라운드 대화
+  useEffect(() => {
+    if (gameState?.status !== 'PLAYING') return;
+
+    if (gameState.phase === 'PRE_SELECTION_DISCUSSION') {
+      setActiveTab('chat');
+    } else if (gameState.phase === 'ROOM_SELECTION' || gameState.phase === 'ROOM_DRAW') {
+      setActiveTab('game');
+    } else if (gameState.phase === 'ABILITY_ACTION') {
+      setActiveTab('ability');
+    } else if (gameState.phase === 'DAY') {
+      setActiveTab('game');
+    }
+  }, [gameState?.phase, gameState?.status]);
+
   // Polling for real-time multiplayer synchronization
   useEffect(() => {
     if (!gameState || !currentUserId) return;
@@ -642,8 +658,8 @@ export default function App() {
           />
         )}
 
-        {/* REAL-TIME CHAT TAB - available from lobby through active game */}
-        {activeTab === 'chat' && currentPlayer && (
+        {/* Lobby chat */}
+        {gameState.status === 'LOBBY' && activeTab === 'chat' && currentPlayer && (
           <ChatPanel
             game={gameState}
             currentPlayer={currentPlayer}
@@ -663,6 +679,16 @@ export default function App() {
               isSubmitting={isSubmitting}
             />
 
+            {/* During discussion, chat sits directly under the phase timer. */}
+            {activeTab === 'chat' && currentPlayer && (
+              <ChatPanel
+                game={gameState}
+                currentPlayer={currentPlayer}
+                onSendMessage={handleSendChatMessage}
+                isSubmitting={isSubmitting}
+              />
+            )}
+
             {/* TAB: GAME (Main Play Screen) */}
             {activeTab === 'game' && (
               <div className="space-y-5">
@@ -670,15 +696,12 @@ export default function App() {
                   <div className="p-5 rounded-3xl bg-zinc-900/80 border border-zinc-800 space-y-3">
                     <div className="flex items-center gap-2">
                       <MessageCircle className="w-5 h-5 text-blue-400" />
-                      <h3 className="font-black text-white">사전 대화 · 특수능력 단계</h3>
+                      <h3 className="font-black text-white">자유 대화 단계</h3>
                     </div>
                     <p className="text-xs text-zinc-400 leading-relaxed">
-                      채팅에서 전략을 논의하고, 사용형 직업은 아래의 <strong className="text-yellow-400">능력</strong> 탭에서 행동을 먼저 처리하세요. 시간이 끝나면 방 선택으로 자동 이동합니다.
+                      지금은 대화만 진행합니다. 시간이 끝나면 모든 플레이어 화면이 자동으로 <strong className="text-red-400">방 선택</strong>으로 이동합니다.
                     </p>
-                    <div className="grid grid-cols-2 gap-2">
-                      <button type="button" onClick={() => setActiveTab('chat')} className="py-3 rounded-xl bg-zinc-800 border border-zinc-700 text-sm font-bold text-white">채팅 열기</button>
-                      <button type="button" onClick={() => setActiveTab('ability')} className="py-3 rounded-xl bg-yellow-500 text-zinc-950 text-sm font-black">능력 사용</button>
-                    </div>
+                    <button type="button" onClick={() => setActiveTab('chat')} className="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-sm font-bold text-white">채팅으로 이동</button>
                   </div>
                 )}
 
@@ -700,7 +723,6 @@ export default function App() {
                   <DayPhase
                     game={gameState}
                     currentPlayer={currentPlayer}
-                    onGoToDiscussion={() => handleSetPhase('DISCUSSION')}
                     onSelectTab={(tab) => {
                       if (tab === 'hub') setActiveTab('role');
                       else if (tab === 'players') setActiveTab('players');
@@ -728,7 +750,7 @@ export default function App() {
                     <Zap className="w-5 h-5 text-yellow-400" />
                     <div>
                       <h3 className="text-sm font-black text-white">내 특수능력</h3>
-                      <p className="text-[11px] text-zinc-400">사용형 능력은 여기서 직접 실행합니다. 자동/패시브 능력은 발동 조건과 결과가 표시됩니다.</p>
+                      <p className="text-[11px] text-zinc-400">방 선택 직후 자동으로 열리는 단계입니다. 사용형 능력은 제한 시간 안에 여기서 실행합니다.</p>
                     </div>
                   </div>
                 </div>

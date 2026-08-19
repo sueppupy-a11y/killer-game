@@ -97,12 +97,20 @@ const DEFAULT_SETTINGS: GameSettings = {
   maxRounds: 10,
   preDiscussionTimeSeconds: 60, // 1분 사전 대화
   roomSelectionTimeSeconds: 15, // 15초 방 선택 제한
+  abilityActionTimeSeconds: 15, // 방 선택 후 특수능력 선택 시간
+  dayResultTimeSeconds: 8, // 낮 결과 발표 후 자동 다음 라운드까지
   allowRoleAbilities: true,
   killerWinConditionText: '총 3회 살인 성공 또는 10라운드 생존/최종 투표 승리',
   citizenWinConditionText: '경찰이 진짜 살인마를 체포하거나 최종 투표에서 살인마 검거',
   neutralWinConditionText: '소매치기(3회 절도+생존), 사이코패스(살인3회+생존), 도박꾼(베팅적중+생존)',
-  autoAdvanceRound: false,
+  autoAdvanceRound: true,
 };
+
+// Older persisted rooms may not have newly added phase timing settings.
+Object.values(games).forEach((game) => {
+  game.settings = { ...DEFAULT_SETTINGS, ...(game.settings || {}) };
+  if (!game.chatMessages) game.chatMessages = [];
+});
 
 function addGameLog(
   game: GameState,
@@ -143,6 +151,8 @@ function initializeRoundRoomOptions(game: GameState) {
       p.isRoomRevealed = false;
       p.usedRoomPassThisRound = false;
       p.usedPrisonPassThisRound = false;
+      p.extrasensoryRoomCount = null;
+      p.policeAttackedAlert = false;
 
       // If Bot, automatically select one of the two options and confirm
       if (p.isBot) {
@@ -502,7 +512,7 @@ function executeResolveMovement(game: GameState) {
   }
 
   game.phase = 'DAY';
-  game.phaseExpiresAt = null;
+  game.phaseExpiresAt = Date.now() + (game.settings.dayResultTimeSeconds || 8) * 1000;
   game.updatedAt = Date.now();
 
   const aliveCount = game.players.filter((p) => p.status === 'ALIVE').length;
@@ -515,42 +525,122 @@ function executeResolveMovement(game: GameState) {
   evaluateWinCondition(game);
 }
 
+// ===== Automatic round phase machine =====
+// Desired flow:
+// 대화 -> 방 선택 -> 특수능력 -> 낮 결과 -> 다음 라운드 -> 대화 ...
+function allAliveRoomsConfirmed(game: GameState): boolean {
+  const alivePlayers = game.players.filter((p) => p.status === 'ALIVE');
+  return (
+    alivePlayers.length > 0 &&
+    alivePlayers.every(
+      (p) =>
+        (p.confirmedRoom || p.roomConfirmed) &&
+        (!!p.selectedRoom || p.currentRoom === 'PRISON')
+    )
+  );
+}
+
+function autoConfirmMissingRooms(game: GameState) {
+  game.players.forEach((p) => {
+    if (p.status !== 'ALIVE' || p.confirmedRoom || p.roomConfirmed) return;
+
+    // A timeout must never invent a room outside the player's two candidates.
+    if (!p.randomRoomOptions || p.randomRoomOptions.length < 2) {
+      p.randomRoomOptions = generateTwoDistinctRooms();
+      p.roomOptionsGenerated = true;
+    }
+
+    const chosen = p.selectedRoom || p.randomRoomOptions[Math.floor(Math.random() * 2)];
+    p.selectedRoom = chosen;
+    p.currentRoom = chosen;
+    p.confirmedRoom = true;
+    p.roomConfirmed = true;
+    p.isRoomRevealed = true;
+  });
+}
+
+function beginRoomSelection(game: GameState, now = Date.now()) {
+  game.phase = 'ROOM_SELECTION';
+  game.phaseExpiresAt = now + (game.settings.roomSelectionTimeSeconds || 15) * 1000;
+  game.updatedAt = now;
+  addGameLog(game, `[방 선택 시작] 랜덤 후보 2개 중 이동할 방 1개를 선택하세요.`, 'phase');
+
+  // Bots may already have confirmed at round initialization.
+  if (allAliveRoomsConfirmed(game)) beginAbilityAction(game, now);
+}
+
+function beginAbilityAction(game: GameState, now = Date.now()) {
+  if (game.status !== 'PLAYING') return;
+  game.phase = 'ABILITY_ACTION';
+  game.phaseExpiresAt = now + (game.settings.abilityActionTimeSeconds || 15) * 1000;
+  game.updatedAt = now;
+  addGameLog(
+    game,
+    `[특수능력 단계] 방 선택이 끝났습니다. 사용형 직업은 지금 능력을 선택/실행하세요.`,
+    'phase'
+  );
+}
+
+function advanceToNextRound(game: GameState, now = Date.now()) {
+  if (game.status !== 'PLAYING') return;
+
+  if (game.round >= game.maxRound) {
+    game.phase = 'RESULT_DISCUSSION';
+    game.phaseExpiresAt = null;
+    game.updatedAt = now;
+    evaluateWinCondition(game);
+    return;
+  }
+
+  game.round += 1;
+  deliverForensicCluesForNewRound(game);
+  game.phase = 'PRE_SELECTION_DISCUSSION';
+  game.phaseExpiresAt = now + (game.settings.preDiscussionTimeSeconds || 60) * 1000;
+  game.wardenTargetPlayerId = null;
+
+  initializeRoundRoomOptions(game);
+
+  game.updatedAt = now;
+  const aliveCount = game.players.filter((p) => p.status === 'ALIVE').length;
+  addGameLog(
+    game,
+    `ROUND ${String(game.round).padStart(2, '0')} 시작! 대화 시간이 시작되었습니다. (${aliveCount}명 생존)`,
+    'phase'
+  );
+}
+
 // Check timer & auto transitions
 function processGameTimeouts(game: GameState) {
   if (game.status !== 'PLAYING') return;
 
   const now = Date.now();
 
-  // 1. If in PRE_SELECTION_DISCUSSION and time expired -> switch to ROOM_SELECTION
+  // 1. 대화 종료 -> 방 선택
   if (game.phase === 'PRE_SELECTION_DISCUSSION' && game.phaseExpiresAt && now >= game.phaseExpiresAt) {
-    game.phase = 'ROOM_SELECTION';
-    game.phaseExpiresAt = now + game.settings.roomSelectionTimeSeconds * 1000;
-    game.updatedAt = now;
-    addGameLog(
-      game,
-      `[방 뽑기/선택 시작] 방 후보를 확인하고 이동할 방을 선택해주세요!`,
-      'phase'
-    );
+    beginRoomSelection(game, now);
   }
-
-  // 2. If in ROOM_SELECTION and time expired -> auto resolve!
+  // 2. 방 선택 종료 -> 미선택자는 후보 2개 중 자동 확정 -> 특수능력
   else if (game.phase === 'ROOM_SELECTION' && game.phaseExpiresAt && now >= game.phaseExpiresAt) {
+    autoConfirmMissingRooms(game);
+    beginAbilityAction(game, now);
+  }
+  // 3. 특수능력 종료 -> 방/살인/절도 등 정산 -> 낮 결과
+  else if (game.phase === 'ABILITY_ACTION' && game.phaseExpiresAt && now >= game.phaseExpiresAt) {
     executeResolveMovement(game);
+  }
+  // 4. 낮 결과 표시 종료 -> 자동 다음 라운드
+  else if (game.phase === 'DAY' && game.phaseExpiresAt && now >= game.phaseExpiresAt) {
+    advanceToNextRound(game, now);
   }
 }
 
-// Check if all alive players have drawn/selected room
+// Check if all alive players have selected one of their two rooms.
 function checkAllRoomsConfirmed(game: GameState) {
   if (game.status !== 'PLAYING') return;
   if (game.phase !== 'ROOM_SELECTION' && game.phase !== 'ROOM_DRAW') return;
 
-  const alivePlayers = game.players.filter((p) => p.status === 'ALIVE');
-  const allConfirmed =
-    alivePlayers.length > 0 &&
-    alivePlayers.every((p) => (p.confirmedRoom || p.roomConfirmed) && (p.selectedRoom || p.currentRoom === 'PRISON'));
-
-  if (allConfirmed) {
-    executeResolveMovement(game);
+  if (allAliveRoomsConfirmed(game)) {
+    beginAbilityAction(game);
   }
 }
 
@@ -910,7 +1000,7 @@ app.post('/api/games/:gameId/start', (req: Request, res: Response) => {
 
   addGameLog(
     game,
-    `[게임 시작] 12인의 비밀 역할이 배정되었습니다. ROUND 01 사전 대화/특수능력 단계가 시작되었습니다!`,
+    `[게임 시작] 12인의 비밀 역할이 배정되었습니다. ROUND 01 대화 시간이 시작되었습니다!`,
     'phase'
   );
 
@@ -1088,8 +1178,8 @@ app.post('/api/games/:gameId/warden-jail', (req: Request, res: Response) => {
     res.status(400).json({ error: '생존한 교도관만 능력을 사용할 수 있습니다.' });
     return;
   }
-  if (game.phase !== 'PRE_SELECTION_DISCUSSION') {
-    res.status(400).json({ error: '교도관 능력은 방 선택 전 사전 대화 단계에서만 사용할 수 있습니다.' });
+  if (game.phase !== 'ABILITY_ACTION') {
+    res.status(400).json({ error: '교도관 능력은 방 선택 후 특수능력 단계에서만 사용할 수 있습니다.' });
     return;
   }
   if (game.wardenTargetPlayerId) {
@@ -1108,9 +1198,9 @@ app.post('/api/games/:gameId/warden-jail', (req: Request, res: Response) => {
       return;
     }
 
+    // 방 선택 결과는 보존하고 실제 이동 위치만 감옥으로 덮어쓴다.
+    // 탈옥권을 쓰면 본래 선택했던 방으로 되돌아갈 수 있다.
     target.currentRoom = 'PRISON';
-    target.selectedRoom = null;
-    target.drawnRoom = null;
     game.wardenTargetPlayerId = target.id;
     requester.abilityUsesRemaining = Math.max(0, requester.abilityUsesRemaining - 1);
 
@@ -1138,6 +1228,11 @@ app.post('/api/games/:gameId/use-prison-pass', (req: Request, res: Response) => 
     return;
   }
 
+  if (game.phase !== 'ABILITY_ACTION') {
+    res.status(400).json({ error: '탈옥권은 특수능력 단계에서만 사용할 수 있습니다.' });
+    return;
+  }
+
   const player = game.players.find((p) => p.id === playerId);
   if (!player || player.currentRoom !== 'PRISON') {
     res.status(400).json({ error: '감옥 상태가 아닙니다.' });
@@ -1151,8 +1246,9 @@ app.post('/api/games/:gameId/use-prison-pass', (req: Request, res: Response) => 
 
   player.inventory.prisonPassCount -= 1;
   player.usedPrisonPassThisRound = true;
-  player.currentRoom = null; // Released back to draw A~F rooms
-  player.confirmedRoom = false;
+  player.currentRoom = player.selectedRoom || null; // Return to the room chosen before imprisonment
+  player.confirmedRoom = true;
+  player.roomConfirmed = true;
 
   addGameLog(game, `${player.nickname} 님이 탈옥권을 사용하여 감옥에서 벗어났습니다.`, 'warden');
   game.updatedAt = Date.now();
@@ -1168,6 +1264,11 @@ app.post('/api/games/:gameId/gambler-bet', (req: Request, res: Response) => {
 
   if (!game) {
     res.status(404).json({ error: '게임을 찾을 수 없습니다.' });
+    return;
+  }
+
+  if (game.phase !== 'ABILITY_ACTION') {
+    res.status(400).json({ error: '도박꾼 베팅은 특수능력 단계에서만 할 수 있습니다.' });
     return;
   }
 
@@ -1201,6 +1302,10 @@ app.post('/api/games/:gameId/police-arrest', (req: Request, res: Response) => {
   }
   if (game.status !== 'PLAYING') {
     res.status(400).json({ error: '게임이 진행 중이 아닙니다.' });
+    return;
+  }
+  if (game.phase !== 'ABILITY_ACTION') {
+    res.status(400).json({ error: '경찰 체포는 특수능력 단계에서만 사용할 수 있습니다.' });
     return;
   }
 
@@ -1273,6 +1378,11 @@ app.post('/api/games/:gameId/corrupt-police-arrest', (req: Request, res: Respons
     return;
   }
 
+  if (game.phase !== 'ABILITY_ACTION') {
+    res.status(400).json({ error: '부패경찰 체포는 특수능력 단계에서만 사용할 수 있습니다.' });
+    return;
+  }
+
   const requester = game.players.find((p) => p.id === playerId);
   if (!requester || requester.roleId !== 'corrupt_police') {
     res.status(403).json({ error: '부패경찰만 사용할 수 있습니다.' });
@@ -1329,10 +1439,7 @@ app.post('/api/games/:gameId/skip-discussion', (req: Request, res: Response) => 
     return;
   }
 
-  game.phase = 'ROOM_SELECTION';
-  game.phaseExpiresAt = Date.now() + game.settings.roomSelectionTimeSeconds * 1000;
-  game.updatedAt = Date.now();
-  addGameLog(game, `사전 대화가 종료되고 [방 뽑기/선택 단계(15초)]가 시작되었습니다.`, 'phase');
+  beginRoomSelection(game);
 
   res.json({ success: true, game: sanitizeGameState(game, playerId) });
 });
@@ -1355,29 +1462,12 @@ app.post('/api/games/:gameId/next-round', (req: Request, res: Response) => {
     res.status(400).json({ error: '게임이 진행 중이 아닙니다.' });
     return;
   }
-
-  if (game.round >= game.maxRound) {
-    evaluateWinCondition(game);
-    res.json({ success: true, game: sanitizeGameState(game, playerId) });
+  if (game.phase !== 'DAY') {
+    res.status(400).json({ error: '다음 라운드는 낮 결과 발표가 끝난 뒤 자동으로 시작됩니다.' });
     return;
   }
 
-  game.round += 1;
-  deliverForensicCluesForNewRound(game);
-  game.phase = 'PRE_SELECTION_DISCUSSION';
-  game.phaseExpiresAt = Date.now() + game.settings.preDiscussionTimeSeconds * 1000;
-  game.wardenTargetPlayerId = null;
-
-  // Reset and initialize 2 distinct room options for each alive player
-  initializeRoundRoomOptions(game);
-
-  game.updatedAt = Date.now();
-  const aliveCount = game.players.filter((p) => p.status === 'ALIVE').length;
-  addGameLog(
-    game,
-    `ROUND ${String(game.round).padStart(2, '0')} 시작! 사전 대화 및 특수능력 사용 단계입니다. (${aliveCount}명 생존)`,
-    'phase'
-  );
+  advanceToNextRound(game);
 
   res.json({ success: true, game: sanitizeGameState(game, playerId) });
 });
@@ -1506,7 +1596,11 @@ app.post('/api/games/:gameId/host/toggle-pause', (req: Request, res: Response) =
     if (game.phase === 'PRE_SELECTION_DISCUSSION') {
       game.phaseExpiresAt = Date.now() + 60000;
     } else if (game.phase === 'ROOM_SELECTION') {
-      game.phaseExpiresAt = Date.now() + 15000;
+      game.phaseExpiresAt = Date.now() + (game.settings.roomSelectionTimeSeconds || 15) * 1000;
+    } else if (game.phase === 'ABILITY_ACTION') {
+      game.phaseExpiresAt = Date.now() + (game.settings.abilityActionTimeSeconds || 15) * 1000;
+    } else if (game.phase === 'DAY') {
+      game.phaseExpiresAt = Date.now() + (game.settings.dayResultTimeSeconds || 8) * 1000;
     }
   }
 

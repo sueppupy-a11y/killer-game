@@ -112,12 +112,12 @@ export const ROLES_DATA: Record<string, RoleDefinition> = {
     teamName: '시민 진영',
     tagline: '의심되는 자를 감옥에 격리하는 교정 집행관',
     description:
-      '라운드 시작 전 플레이어 1명을 선택해 이번 라운드 동안 감옥(PRISON)으로 보낼 수 있습니다. 감옥에 갇힌 자는 일반 방 뽑기를 하지 않습니다.',
+      '방 선택이 끝난 뒤 플레이어 1명을 선택해 이번 라운드 동안 감옥(PRISON)으로 보낼 수 있습니다. 대상이 탈옥권을 사용하면 원래 선택한 방으로 복귀합니다.',
     winCondition: '위험 인물을 격리하고 시민들을 보호하여 승리를 이끄십시오.',
     abilityName: '감옥 수감 지정',
-    abilityDescription: '라운드 시작 전 1명을 감옥으로 격리 (미사용 가능)',
+    abilityDescription: '방 선택 후 1명을 감옥으로 격리 (미사용 가능)',
     abilityMaxUses: 10,
-    abilityCondition: '매 라운드 방 배정 전',
+    abilityCondition: '매 라운드 방 선택 후 특수능력 단계',
   },
   citizen: {
     id: 'citizen',

@@ -138,46 +138,31 @@ export const HostDashboard: React.FC<HostDashboardProps> = ({
 
       {/* Main Flow Controls */}
       <div className="p-4 rounded-2xl bg-zinc-900/90 border border-zinc-800 space-y-4">
-        <div className="flex items-center justify-between">
-          <h3 className="text-sm font-bold text-white flex items-center gap-2">
-            <FastForward className="w-4 h-4 text-red-500" />
-            현재 단계 제어: {game.phase === 'PRE_SELECTION_DISCUSSION' ? '사전 대화 (1분)' : game.phase === 'ROOM_SELECTION' ? '방 선택 (15초)' : '결과 확인 및 토론'}
-          </h3>
-          <span className="text-xs font-mono text-zinc-400">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-bold text-white flex items-center gap-2">
+              <FastForward className="w-4 h-4 text-red-500" />
+              자동 진행 중
+            </h3>
+            <p className="mt-1 text-xs text-zinc-400">
+              대화 → 방 선택 → 특수능력 → 낮 결과 → 다음 라운드 순서로 서버가 자동 전환합니다.
+            </p>
+          </div>
+          <span className="text-xs font-mono text-zinc-400 flex-shrink-0">
             선택 확정: {confirmedCount} / {aliveCount}명
           </span>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          {game.phase === 'PRE_SELECTION_DISCUSSION' ? (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {game.phase === 'PRE_SELECTION_DISCUSSION' && (
             <button
               type="button"
               onClick={onSkipDiscussion}
               disabled={isSubmitting}
-              className="sm:col-span-2 py-3.5 px-4 rounded-xl bg-amber-600 hover:bg-amber-700 active:scale-[0.98] text-white font-bold text-sm transition-all shadow-lg shadow-amber-950 flex items-center justify-center gap-2 cursor-pointer"
+              className="py-3.5 px-4 rounded-xl bg-amber-600 hover:bg-amber-700 active:scale-[0.98] text-white font-bold text-sm transition-all shadow-lg shadow-amber-950 flex items-center justify-center gap-2 cursor-pointer"
             >
               <FastForward className="w-4 h-4" />
-              대화 즉시 종료 ➔ 15초 방 선택 시작
-            </button>
-          ) : game.phase === 'ROOM_SELECTION' ? (
-            <button
-              type="button"
-              onClick={onResolveRound}
-              disabled={isSubmitting}
-              className="sm:col-span-2 py-3.5 px-4 rounded-xl bg-red-600 hover:bg-red-700 active:scale-[0.98] text-white font-bold text-sm transition-all shadow-lg shadow-red-950 flex items-center justify-center gap-2 cursor-pointer"
-            >
-              <CheckCircle2 className="w-4 h-4" />
-              강제 선택 마감 & 이동 결과 정산
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={onNextRound}
-              disabled={isSubmitting}
-              className="sm:col-span-2 py-3.5 px-4 rounded-xl bg-blue-600 hover:bg-blue-700 active:scale-[0.98] text-white font-bold text-sm transition-all shadow-lg shadow-blue-950 flex items-center justify-center gap-2 cursor-pointer"
-            >
-              <Play className="w-4 h-4" />
-              다음 라운드 시작 (ROUND {game.round + 1} 이동)
+              대화만 조기 종료 → 방 선택
             </button>
           )}
 
